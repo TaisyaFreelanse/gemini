@@ -1,0 +1,41 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.core.rate_limiter import rate_limit_middleware
+
+app = FastAPI(
+    title="Web Scraper Gemini API",
+    description="API для парсингу сайтів з промокодами через Gemini AI",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # В продакшені змінити на конкретні домени
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate limiting middleware (100 req/min)
+app.middleware("http")(rate_limit_middleware)
+
+@app.get("/")
+async def root():
+    return {"message": "Web Scraper Gemini API"}
+
+@app.get("/api/v1/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "web-scraper-gemini"
+    }
+
+# Підключаємо роутери
+from app.api.endpoints import parsing, config, reports, scheduler, cache
+
+app.include_router(parsing.router, prefix="/api/v1/parsing", tags=["Parsing"])
+app.include_router(config.router, prefix="/api/v1/config", tags=["Configuration"])
+app.include_router(reports.router, prefix="/api/v1/reports", tags=["Reports"])
+app.include_router(scheduler.router, prefix="/api/v1/scheduler", tags=["Scheduler"])
+app.include_router(cache.router, prefix="/api/v1/cache", tags=["Cache"])

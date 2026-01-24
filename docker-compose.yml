@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: scraper-postgres
+    environment:
+      POSTGRES_DB: scraper_db
+      POSTGRES_USER: scraper_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper_user -d scraper_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: scraper-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scraper-backend
+    environment:
+      DATABASE_URL: postgresql://scraper_user:${POSTGRES_PASSWORD:-changeme}@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DOMAINS_API_URL: ${DOMAINS_API_URL}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN}
+      PROXY_HOST: ${PROXY_HOST}
+      PROXY_HTTP_PORT: ${PROXY_HTTP_PORT:-59100}
+      PROXY_SOCKS_PORT: ${PROXY_SOCKS_PORT:-59101}
+      PROXY_LOGIN: ${PROXY_LOGIN}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scraper-celery-worker
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=10
+    environment:
+      DATABASE_URL: postgresql://scraper_user:${POSTGRES_PASSWORD:-changeme}@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DOMAINS_API_URL: ${DOMAINS_API_URL}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN}
+      PROXY_HOST: ${PROXY_HOST}
+      PROXY_HTTP_PORT: ${PROXY_HTTP_PORT:-59100}
+      PROXY_SOCKS_PORT: ${PROXY_SOCKS_PORT:-59101}
+      PROXY_LOGIN: ${PROXY_LOGIN}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+    depends_on:
+      - redis
+      - postgres
+      - backend
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: scraper-celery-beat
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://scraper_user:${POSTGRES_PASSWORD:-changeme}@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DOMAINS_API_URL: ${DOMAINS_API_URL}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN}
+      PROXY_HOST: ${PROXY_HOST}
+      PROXY_HTTP_PORT: ${PROXY_HTTP_PORT:-59100}
+      PROXY_SOCKS_PORT: ${PROXY_SOCKS_PORT:-59101}
+      PROXY_LOGIN: ${PROXY_LOGIN}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: scraper-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
