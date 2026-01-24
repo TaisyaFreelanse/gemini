@@ -1,50 +1,258 @@
+# ====================
 # Python
+# ====================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-venv/
-ENV/
-env/
+*.egg
 *.egg-info/
 dist/
 build/
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Node
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+.pyenv
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ====================
+# Node.js / Frontend
+# ====================
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-dist/
-.DS_Store
+lerna-debug.log*
+.pnpm-debug.log*
 
-# Environment
+# Build outputs
+dist/
+build/
+.next/
+out/
+.nuxt/
+.cache/
+
+# Frontend dependencies
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# ====================
+# Environment Variables
+# ====================
 .env
 .env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Keep example file
+!.env.example
 
+# ====================
 # Database
+# ====================
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
 
+# PostgreSQL
+postgres_data/
+pgdata/
+
+# Redis
+dump.rdb
+appendonly.aof
+*.rdb
+
+# ====================
 # Docker
+# ====================
 docker-compose.override.yml
+.dockerignore
 
+# ====================
+# Celery
+# ====================
+celerybeat-schedule
+celerybeat.pid
+celerybeat-schedule.db
+
+# ====================
 # Logs
+# ====================
 *.log
 logs/
+*.log.*
+log/
 
-# OS
+# ====================
+# IDE / Editors
+# ====================
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ====================
+# OS Specific
+# ====================
+# macOS
 .DS_Store
-Thumbs.db
+.AppleDouble
+.LSOverride
+Icon
+._*
 
-# Alembic
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ====================
+# Temporary Files
+# ====================
+*.tmp
+*.temp
+*.bak
+*.swp
+tmp/
+temp/
+
+# ====================
+# Alembic / Migrations
+# ====================
+# Keep migration files, but exclude bytecode
 alembic/versions/*.pyc
+alembic/__pycache__/
+
+# ====================
+# Testing / Development
+# ====================
+.tox/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# ====================
+# Project Specific
+# ====================
+# Test results
+TEST_RESULTS.md
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Local development scripts
+scripts/local/
+*.local.sh
+
+# Media files (if you don't want to commit them)
+# media/
+# uploads/
+
+# Static files (usually generated)
+# staticfiles/
+# static_root/
+
+# ====================
+# Security / Secrets
+# ====================
+# SSL certificates
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# API keys and secrets (additional protection)
+secrets/
+credentials/
+*.credentials
+api_keys.txt
+
+# ====================
+# Backup Files
+# ====================
+*.backup
+*.old
+*.orig
+*.bak
+
+# ====================
+# Archives
+# ====================
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+
+# But keep example/template files
+!examples/**
+!templates/**

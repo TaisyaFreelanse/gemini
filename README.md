@@ -1,5 +1,14 @@
 # Web Scraper з Gemini AI
 
+![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-Latest-teal?logo=fastapi)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
+
 Докеризований вебдодаток для автоматичного парсингу сайтів з промокодами через Gemini AI з автоматичною відправкою результатів у webhook.
 
 ## 🚀 Технологічний стек
