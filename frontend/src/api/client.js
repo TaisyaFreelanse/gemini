@@ -62,8 +62,8 @@ export const reportsAPI = {
   list: (params) => apiClient.get('/reports', { params }),
   summary: (params) => apiClient.get('/reports/summary', { params }),
   export: (format, params) => 
-    apiClient.get(`/reports/export/${format}`, { 
-      params,
+    apiClient.get('/reports/export', { 
+      params: { ...params, format },
       responseType: 'blob'
     }),
 };

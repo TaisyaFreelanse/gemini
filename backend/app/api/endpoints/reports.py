@@ -16,6 +16,54 @@ import io
 router = APIRouter()
 
 
+@router.get("", response_model=DetailedReport)
+@router.get("/", response_model=DetailedReport)
+async def get_reports_root(db: Session = Depends(get_db)):
+    """
+    Базовий endpoint - повертає список доменів
+    """
+    from datetime import datetime
+    
+    # Mock дані - список доменів з результатами
+    mock_domains = [
+        DomainReport(
+            domain="example.com",
+            session_id=1,
+            deals_count=5,
+            success=True,
+            scraped_at=datetime.now(),
+            webhook_sent=True,
+            error_count=0,
+            last_error=None
+        ),
+        DomainReport(
+            domain="test.com",
+            session_id=1,
+            deals_count=3,
+            success=True,
+            scraped_at=datetime.now(),
+            webhook_sent=True,
+            error_count=0,
+            last_error=None
+        ),
+        DomainReport(
+            domain="demo.org",
+            session_id=1,
+            deals_count=0,
+            success=False,
+            scraped_at=datetime.now(),
+            webhook_sent=False,
+            error_count=1,
+            last_error="Connection timeout"
+        )
+    ]
+    
+    return DetailedReport(
+        domains=mock_domains,
+        total=len(mock_domains)
+    )
+
+
 @router.get("/summary", response_model=ReportSummary)
 async def get_summary(db: Session = Depends(get_db)):
     """
@@ -28,18 +76,19 @@ async def get_summary(db: Session = Depends(get_db)):
     - Успішні/невдалі спроби
     - Середню продуктивність
     """
-    # TODO: Отримати реальні дані з БД
+    from datetime import datetime
     
+    # Mock дані синхронізовані з /reports endpoint
     return ReportSummary(
-        total_domains=1500,
-        total_sessions=25,
-        total_deals_found=3200,
-        total_deals_sent=3150,
-        successful_scrapes=1420,
-        failed_scrapes=80,
-        average_deals_per_domain=2.13,
-        last_scrape_date=None,
-        domains_per_hour_avg=185.5
+        total_domains=3,  # example.com, test.com, demo.org
+        total_sessions=1,
+        total_deals_found=8,  # 5 + 3 + 0
+        total_deals_sent=8,
+        successful_scrapes=2,  # example.com, test.com
+        failed_scrapes=1,  # demo.org
+        average_deals_per_domain=2.67,  # 8 / 3
+        last_scrape_date=datetime.now(),
+        domains_per_hour_avg=180.0
     )
 
 

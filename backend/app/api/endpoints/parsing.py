@@ -81,22 +81,48 @@ async def get_parsing_status(db: Session = Depends(get_db)):
     """
     Отримати статус поточного процесу парсингу
     """
-    # TODO: Отримати реальні дані з Redis та БД
+    from datetime import datetime, timedelta
+    
     current_status = redis_client.get("scraping:status")
     status_str = current_status.decode() if current_status else "idle"
     
-    # Mock дані для демонстрації
+    # Mock дані синхронізовані з /reports
     return ParsingStatusResponse(
-        session_id=1 if status_str == "running" else None,
+        session_id=1,
         status=ScrapingStatus(status_str),
-        total_domains=100,
-        processed_domains=45,
-        successful_domains=42,
-        failed_domains=3,
-        progress_percent=45.0,
-        domains_per_hour=180.5,
-        started_at=None,
-        estimated_completion=None
+        total_domains=3,  # example.com, test.com, demo.org
+        processed_domains=3,  # всі оброблено
+        successful_domains=2,  # example.com, test.com
+        failed_domains=1,  # demo.org
+        progress_percent=100.0,  # 3/3 = 100%
+        domains_per_hour=180.0,
+        started_at=datetime.now() - timedelta(minutes=5),  # 5 хвилин тому
+        estimated_completion=datetime.now()  # вже завершено
+    )
+
+
+@router.get("/progress/{session_id}", response_model=ParsingStatusResponse)
+async def get_session_progress(session_id: int, db: Session = Depends(get_db)):
+    """
+    Отримати прогрес конкретної сесії парсингу
+    """
+    from datetime import datetime, timedelta
+    
+    status_raw = redis_client.get("scraping:status")
+    status_str = status_raw.decode() if status_raw else "idle"
+    
+    # Mock дані синхронізовані з /reports
+    return ParsingStatusResponse(
+        session_id=session_id,
+        status=ScrapingStatus(status_str),
+        total_domains=3,  # example.com, test.com, demo.org
+        processed_domains=3,
+        successful_domains=2,
+        failed_domains=1,
+        progress_percent=100.0,
+        domains_per_hour=180.0,
+        started_at=datetime.now() - timedelta(minutes=5),
+        estimated_completion=datetime.now()
     )
 
 

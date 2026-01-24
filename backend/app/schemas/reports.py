@@ -19,11 +19,13 @@ class ReportSummary(BaseModel):
 class DomainReport(BaseModel):
     """Звіт по окремому домену"""
     domain: str
-    last_scraped_at: Optional[datetime]
-    scraping_status: str
-    deals_found: int
-    error_count: int
-    last_error: Optional[str]
+    session_id: Optional[int] = None
+    deals_count: int  # Фронтенд очікує deals_count
+    success: bool  # Фронтенд очікує boolean
+    scraped_at: Optional[datetime] = None  # Фронтенд очікує scraped_at
+    webhook_sent: bool = False
+    error_count: int = 0
+    last_error: Optional[str] = None
 
     class Config:
         from_attributes = True

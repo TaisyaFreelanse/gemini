@@ -27,10 +27,12 @@ export default function Reports() {
       if (filters.status !== 'all') params.status = filters.status;
 
       const response = await reportsAPI.list(params);
-      setReports(response.data || []);
+      // Backend повертає {domains: [...], total: N}
+      setReports(response.data?.domains || response.domains || []);
       setLoading(false);
     } catch (err) {
       console.error('Error fetching reports:', err);
+      setReports([]);
       setLoading(false);
     }
   };
@@ -106,15 +108,15 @@ export default function Reports() {
           </div>
           <div className="bg-white p-6 rounded-lg shadow">
             <div className="text-sm font-medium text-gray-500 mb-1">Успішних</div>
-            <div className="text-3xl font-bold text-green-600">{summary.successful || 0}</div>
+            <div className="text-3xl font-bold text-green-600">{summary.successful_scrapes || 0}</div>
           </div>
           <div className="bg-white p-6 rounded-lg shadow">
             <div className="text-sm font-medium text-gray-500 mb-1">Помилок</div>
-            <div className="text-3xl font-bold text-red-600">{summary.failed || 0}</div>
+            <div className="text-3xl font-bold text-red-600">{summary.failed_scrapes || 0}</div>
           </div>
           <div className="bg-white p-6 rounded-lg shadow">
             <div className="text-sm font-medium text-gray-500 mb-1">Знайдено угод</div>
-            <div className="text-3xl font-bold text-blue-600">{summary.total_deals || 0}</div>
+            <div className="text-3xl font-bold text-blue-600">{summary.total_deals_found || 0}</div>
           </div>
         </div>
       )}
