@@ -16,6 +16,14 @@ export default function Reports() {
   useEffect(() => {
     fetchReports();
     fetchSummary();
+    
+    // Автообновление каждые 10 секунд
+    const interval = setInterval(() => {
+      fetchReports();
+      fetchSummary();
+    }, 10000);
+    
+    return () => clearInterval(interval);
   }, [filters]);
 
   const fetchReports = async () => {

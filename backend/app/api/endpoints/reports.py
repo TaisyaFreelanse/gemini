@@ -18,77 +18,143 @@ router = APIRouter()
 
 @router.get("", response_model=DetailedReport)
 @router.get("/", response_model=DetailedReport)
-async def get_reports_root(db: Session = Depends(get_db)):
+async def get_reports_root(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    status: Optional[str] = Query(None),
+    domain: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
     """
-    Базовий endpoint - повертає список доменів
+    Базовий endpoint - повертає список доменів з реальними даними з БД
     """
-    from datetime import datetime
+    from app.db import crud
+    from sqlalchemy import func, case
+    from app.models.scraped_deal import ScrapedDeal
+    from app.models.scraping_session import ScrapingSession
     
-    # Mock дані - список доменів з результатами
-    mock_domains = [
-        DomainReport(
-            domain="example.com",
-            session_id=1,
-            deals_count=5,
-            success=True,
-            scraped_at=datetime.now(),
-            webhook_sent=True,
-            error_count=0,
-            last_error=None
-        ),
-        DomainReport(
-            domain="test.com",
-            session_id=1,
-            deals_count=3,
-            success=True,
-            scraped_at=datetime.now(),
-            webhook_sent=True,
-            error_count=0,
-            last_error=None
-        ),
-        DomainReport(
-            domain="demo.org",
-            session_id=1,
-            deals_count=0,
-            success=False,
-            scraped_at=datetime.now(),
-            webhook_sent=False,
-            error_count=1,
-            last_error="Connection timeout"
+    # Отримуємо угоди з БД з групуванням по доменам
+    try:
+        query = db.query(
+            ScrapedDeal.domain,
+            ScrapedDeal.session_id,
+            func.count(ScrapedDeal.id).label('deals_count'),
+            func.max(ScrapedDeal.created_at).label('scraped_at'),
+            func.max(case((ScrapedDeal.webhook_sent == True, 1), else_=0)).label('webhook_sent'),
+            func.count(case((ScrapedDeal.webhook_sent == False, 1))).label('webhook_pending')
+        ).group_by(ScrapedDeal.domain, ScrapedDeal.session_id)
+    except Exception as e:
+        # Если таблица не существует или нет данных, возвращаем пустой список
+        return DetailedReport(
+            domains=[],
+            total=0
         )
-    ]
     
+    # Фільтри
+    if domain:
+        query = query.filter(ScrapedDeal.domain.ilike(f"%{domain}%"))
+    
+    # Підрахунок загальної кількості
+    total = query.count()
+    
+    # Пагінація
+    results = query.order_by(func.max(ScrapedDeal.created_at).desc()).offset(skip).limit(limit).all()
+    
+    # Формуємо список доменів з результатами
+    domain_reports = []
+    for result in results:
+        # Визначаємо статус: успішний якщо є угоди
+        success = result.deals_count > 0
+        
+        domain_reports.append(
+            DomainReport(
+                domain=result.domain,
+                session_id=result.session_id,
+                deals_count=result.deals_count,
+                success=success,
+                scraped_at=result.scraped_at,
+                webhook_sent=bool(result.webhook_sent),
+                error_count=0 if success else 1,
+                last_error=None if success else "No deals found"
+            )
+        )
+    
+    # Якщо немає даних в БД, повертаємо порожній список (не mock)
     return DetailedReport(
-        domains=mock_domains,
-        total=len(mock_domains)
+        domains=domain_reports,
+        total=total
     )
 
 
 @router.get("/summary", response_model=ReportSummary)
 async def get_summary(db: Session = Depends(get_db)):
     """
-    Отримати загальну статистику по всій системі
-    
-    Включає:
-    - Загальну кількість доменів
-    - Кількість сесій парсингу
-    - Кількість знайдених угод
-    - Успішні/невдалі спроби
-    - Середню продуктивність
+    Отримати загальну статистику по всій системі з реальними даними з БД
     """
-    from datetime import datetime
+    from app.models.scraped_deal import ScrapedDeal
+    from app.models.scraping_session import ScrapingSession
+    from sqlalchemy import func, distinct
     
-    # Mock дані синхронізовані з /reports endpoint
+    # Отримуємо реальні дані з БД
+    try:
+        total_deals = db.query(func.count(ScrapedDeal.id)).scalar() or 0
+        total_deals_sent = db.query(func.count(ScrapedDeal.id)).filter(
+            ScrapedDeal.webhook_sent == True
+        ).scalar() or 0
+        
+        # Унікальні домени
+        unique_domains = db.query(func.count(distinct(ScrapedDeal.domain))).scalar() or 0
+        
+        # Сесії
+        total_sessions = db.query(func.count(ScrapingSession.id)).scalar() or 0
+        successful_sessions = db.query(func.count(ScrapingSession.id)).filter(
+            ScrapingSession.status == "completed"
+        ).scalar() or 0
+        failed_sessions = db.query(func.count(ScrapingSession.id)).filter(
+            ScrapingSession.status == "failed"
+        ).scalar() or 0
+        
+        # Остання дата парсингу
+        last_scrape = db.query(func.max(ScrapedDeal.created_at)).scalar()
+        
+        # Середня кількість угод на домен
+        avg_deals = total_deals / unique_domains if unique_domains > 0 else 0
+        
+        # Середня швидкість (доменів за годину) - беремо з останньої сесії
+        last_session = db.query(ScrapingSession).order_by(
+            ScrapingSession.started_at.desc()
+        ).first()
+        
+        domains_per_hour = 0
+        if last_session and last_session.completed_at and last_session.started_at:
+            duration_hours = (last_session.completed_at - last_session.started_at).total_seconds() / 3600
+            if duration_hours > 0:
+                domains_per_hour = last_session.processed_domains / duration_hours
+    except Exception as e:
+        # Если таблицы не существуют, возвращаем нулевые значения
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Ошибка получения данных из БД: {e}")
+        total_deals = 0
+        total_deals_sent = 0
+        unique_domains = 0
+        total_sessions = 0
+        successful_sessions = 0
+        failed_sessions = 0
+        last_scrape = None
+        avg_deals = 0
+        domains_per_hour = 0
+    
     return ReportSummary(
-        total_domains=3,  # example.com, test.com, demo.org
-        total_sessions=1,
-        total_deals_found=8,  # 5 + 3 + 0
-        total_deals_sent=8,
-        successful_scrapes=2,  # example.com, test.com
-        failed_scrapes=1,  # demo.org
-        average_deals_per_domain=2.67,  # 8 / 3
-        last_scrape_date=datetime.now(),
-        domains_per_hour_avg=180.0
+        total_domains=unique_domains,
+        total_sessions=total_sessions,
+        total_deals_found=total_deals,
+        total_deals_sent=total_deals_sent,
+        successful_scrapes=successful_sessions,
+        failed_scrapes=failed_sessions,
+        average_deals_per_domain=round(avg_deals, 2),
+        last_scrape_date=last_scrape,
+        domains_per_hour_avg=round(domains_per_hour, 2) if domains_per_hour > 0 else 0.0
     )
 
 

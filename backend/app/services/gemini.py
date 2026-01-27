@@ -145,6 +145,12 @@ HTML контент сайту {domain}:
             response_text = response_text[:-3]
         response_text = response_text.strip()
         
+        # Пробуємо знайти JSON в тексті (може бути обгорнутий в текст)
+        import re
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
         try:
             data = json.loads(response_text)
             
@@ -157,7 +163,20 @@ HTML контент сайту {domain}:
         
         except json.JSONDecodeError as e:
             logger.error(f"Помилка парсингу JSON: {e}")
-            logger.debug(f"Сира відповідь: {response_text[:500]}...")
+            logger.error(f"Сира відповідь (перші 1000 символів): {response_text[:1000]}")
+            # Пробуємо витягнути хоча б частину JSON
+            try:
+                # Шукаємо перший [ і останній ]
+                start = response_text.find('[')
+                end = response_text.rfind(']')
+                if start >= 0 and end > start:
+                    partial_json = response_text[start:end+1]
+                    data = json.loads(partial_json)
+                    if isinstance(data, list):
+                        logger.info(f"Вдалося витягнути частковий JSON: {len(data)} елементів")
+                        return data
+            except:
+                pass
             return []
     
     def _validate_deals(self, deals_data: List[Dict]) -> Tuple[List[DealSchema], List[Dict]]:
@@ -229,9 +248,10 @@ HTML контент сайту {domain}:
                 
                 # Отримуємо текст відповіді
                 response_text = response.text
-                metadata["raw_response"] = response_text[:1000]  # Зберігаємо перші 1000 символів
+                metadata["raw_response"] = response_text[:2000]  # Зберігаємо перші 2000 символів
                 
                 logger.info(f"✓ Отримано відповідь від Gemini ({len(response_text)} символів)")
+                logger.debug(f"Перші 500 символів відповіді: {response_text[:500]}")
                 
                 # Парсимо JSON
                 deals_data = self._parse_json_response(response_text)

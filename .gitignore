@@ -256,3 +256,4 @@ api_keys.txt
 # But keep example/template files
 !examples/**
 !templates/**
+*.md

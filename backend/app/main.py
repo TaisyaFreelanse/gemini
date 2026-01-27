@@ -32,10 +32,11 @@ async def health_check():
     }
 
 # Підключаємо роутери
-from app.api.endpoints import parsing, config, reports, scheduler, cache
+from app.api.endpoints import parsing, config, reports, scheduler, cache, mock_domains
 
 app.include_router(parsing.router, prefix="/api/v1/parsing", tags=["Parsing"])
 app.include_router(config.router, prefix="/api/v1/config", tags=["Configuration"])
 app.include_router(reports.router, prefix="/api/v1/reports", tags=["Reports"])
 app.include_router(scheduler.router, prefix="/api/v1/scheduler", tags=["Scheduler"])
 app.include_router(cache.router, prefix="/api/v1/cache", tags=["Cache"])
+app.include_router(mock_domains.router, prefix="/api/v1", tags=["Mock"])

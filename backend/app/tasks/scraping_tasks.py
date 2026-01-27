@@ -52,6 +52,9 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
         # Оновлюємо статус
         _update_task_status(task_id, domain, "completed", session_id, result)
         
+        # Оновлюємо сесію в БД
+        _update_session_in_db(session_id, result)
+        
         logger.info(f"[Task {task_id}] ✓ Завершено парсинг {domain}: {result.get('deals_count', 0)} угод")
         return result
     
@@ -66,6 +69,10 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
         }
         
         _update_task_status(task_id, domain, "failed", session_id, error_result)
+        
+        # Оновлюємо сесію в БД
+        _update_session_in_db(session_id, error_result)
+        
         return error_result
 
 
@@ -131,11 +138,33 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         result['error'] = f"Gemini error: {str(e)}"
         return result
     
-    # Крок 3: Зберігаємо результат в Redis (тимчасово, поки немає БД)
+    # Крок 3: Зберігаємо результат в БД та Redis
     try:
+        # Зберігаємо в Redis для швидкого доступу
         _save_scraping_result(session_id, domain, result)
+        
+        # Зберігаємо в БД для постійного зберігання
+        if result['success'] and result['deals_count'] > 0:
+            from app.db.session import SessionLocal
+            from app.db import crud
+            
+            db = SessionLocal()
+            try:
+                # Зберігаємо кожну угоду в БД
+                for deal_data in result['deals']:
+                    crud.create_scraped_deal(
+                        db=db,
+                        session_id=session_id,
+                        domain=domain,
+                        deal_data=deal_data
+                    )
+                logger.info(f"✓ Збережено {result['deals_count']} угод в БД для {domain}")
+            except Exception as db_error:
+                logger.error(f"Помилка збереження в БД: {db_error}")
+            finally:
+                db.close()
     except Exception as e:
-        logger.warning(f"Не вдалося зберегти результат в Redis: {e}")
+        logger.warning(f"Не вдалося зберегти результат: {e}")
     
     # Крок 4: Відправляємо результати в webhook
     if result['success'] and result['deals_count'] > 0:
@@ -246,6 +275,56 @@ def _save_scraping_result(session_id: int, domain: str, result: Dict):
         
     except Exception as e:
         logger.error(f"Помилка збереження результату: {e}")
+
+
+def _update_session_in_db(session_id: int, result: Dict):
+    """Оновити сесію парсингу в БД"""
+    try:
+        from app.db.session import SessionLocal
+        from app.db import crud
+        
+        db = SessionLocal()
+        try:
+            session = crud.get_scraping_session(db, session_id)
+            if session:
+                # Отримуємо поточні значення
+                processed = session.processed_domains or 0
+                successful = session.successful_domains or 0
+                failed = session.failed_domains or 0
+                
+                # Оновлюємо лічильники
+                processed += 1
+                if result.get('success'):
+                    successful += 1
+                else:
+                    failed += 1
+                
+                # Перевіряємо чи всі домени оброблені
+                status = session.status
+                if processed >= session.total_domains:
+                    status = "completed"
+                
+                # Оновлюємо сесію
+                crud.update_scraping_session(
+                    db=db,
+                    session_id=session_id,
+                    processed=processed,
+                    successful=successful,
+                    failed=failed,
+                    status=status
+                )
+                
+                # Оновлюємо статус в Redis
+                if status == "completed":
+                    redis_client.set("scraping:status", "completed")
+                elif status == "failed":
+                    redis_client.set("scraping:status", "failed")
+                
+                logger.debug(f"Оновлено сесію {session_id}: processed={processed}, successful={successful}, failed={failed}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Помилка оновлення сесії в БД: {e}")
 
 
 @celery_app.task(name='start_batch_scraping')
