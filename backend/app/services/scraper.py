@@ -27,7 +27,12 @@ class WebScraper:
     
     def __init__(self, proxy_rotator: Optional[ProxyRotator] = None):
         self.proxy_rotator = proxy_rotator
-        self.timeout = aiohttp.ClientTimeout(total=settings.SCRAPING_TIMEOUT)
+        # connect=15 — час на підключення до проксі; total — на весь запит
+        self.timeout = aiohttp.ClientTimeout(
+            total=settings.SCRAPING_TIMEOUT,
+            connect=15,
+            sock_connect=15,
+        )
         self.max_retries = settings.SCRAPING_MAX_RETRIES
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -56,32 +61,39 @@ class WebScraper:
             url = 'https://' + url
         
         for attempt in range(self.max_retries):
-            proxy_url = None
-            
+            proxy_base_url = None
+            proxy_auth = None
+
             try:
-                # Отримуємо проксі якщо потрібно
+                # Отримуємо проксі (base_url + auth окремо — рекомендовано для aiohttp)
                 if use_proxy and self.proxy_rotator:
-                    proxy_url = self.proxy_rotator.get_next_proxy(proxy_type="http")
-                    if not proxy_url:
+                    parts = self.proxy_rotator.get_next_proxy_for_aiohttp(proxy_type="http")
+                    if not parts:
                         logger.error("Не вдалося отримати проксі")
                         return None, "Всі проксі недоступні"
-                
+                    proxy_base_url, login, password = parts
+                    proxy_auth = aiohttp.BasicAuth(login, password) if (login and password) else None
+
                 # Виконуємо HTTP запит
                 async with aiohttp.ClientSession(timeout=self.timeout) as session:
                     kwargs = {'headers': self.headers}
-                    if proxy_url:
-                        kwargs['proxy'] = proxy_url
-                    
-                    logger.info(f"Спроба {attempt + 1}/{self.max_retries}: Завантаження {url}" + 
-                               (f" через проксі {proxy_url.split('@')[1]}" if proxy_url else ""))
-                    
+                    if proxy_base_url:
+                        kwargs['proxy'] = proxy_base_url
+                        if proxy_auth:
+                            kwargs['proxy_auth'] = proxy_auth
+
+                    logger.info(
+                        f"Спроба {attempt + 1}/{self.max_retries}: Завантаження {url}" +
+                        (f" через проксі {proxy_base_url}" if proxy_base_url else "")
+                    )
+
                     async with session.get(url, **kwargs) as response:
                         if response.status == 200:
                             html_content = await response.text()
                             
                             # Успішне завантаження - відмічаємо проксі як робочий
-                            if proxy_url and self.proxy_rotator:
-                                self.proxy_rotator.mark_proxy_success(proxy_url)
+                            if proxy_base_url and self.proxy_rotator:
+                                self.proxy_rotator.mark_proxy_success(proxy_base_url)
                             
                             logger.info(f"✓ Успішно завантажено {url} ({len(html_content)} байт)")
                             return html_content, None
@@ -95,26 +107,26 @@ class WebScraper:
                                 return None, error_msg
                             
                             # Для інших помилок - позначаємо проксі як невдалий
-                            if proxy_url and self.proxy_rotator:
-                                self.proxy_rotator.mark_proxy_failed(proxy_url)
-            
+                            if proxy_base_url and self.proxy_rotator:
+                                self.proxy_rotator.mark_proxy_failed(proxy_base_url)
+
             except asyncio.TimeoutError:
                 error_msg = f"Timeout після {settings.SCRAPING_TIMEOUT} секунд"
                 logger.warning(f"✗ {error_msg} для {url}")
-                if proxy_url and self.proxy_rotator:
-                    self.proxy_rotator.mark_proxy_failed(proxy_url)
-            
+                if proxy_base_url and self.proxy_rotator:
+                    self.proxy_rotator.mark_proxy_failed(proxy_base_url)
+
             except aiohttp.ClientError as e:
-                error_msg = f"Помилка з'єднання: {str(e)}"
-                logger.warning(f"✗ {error_msg} для {url}")
-                if proxy_url and self.proxy_rotator:
-                    self.proxy_rotator.mark_proxy_failed(proxy_url)
-            
+                error_msg = f"Помилка з'єднання ({type(e).__name__}): {str(e)}"
+                logger.warning(f"✗ {error_msg} для {url}" + (f" (проксі {proxy_base_url})" if proxy_base_url else ""))
+                if proxy_base_url and self.proxy_rotator:
+                    self.proxy_rotator.mark_proxy_failed(proxy_base_url)
+
             except Exception as e:
                 error_msg = f"Неочікувана помилка: {str(e)}"
                 logger.error(f"✗ {error_msg} для {url}", exc_info=True)
-                if proxy_url and self.proxy_rotator:
-                    self.proxy_rotator.mark_proxy_failed(proxy_url)
+                if proxy_base_url and self.proxy_rotator:
+                    self.proxy_rotator.mark_proxy_failed(proxy_base_url)
             
             # Чекаємо перед наступною спробою (exponential backoff)
             if attempt < self.max_retries - 1:

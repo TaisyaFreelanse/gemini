@@ -2,12 +2,9 @@ import { useState, useEffect, useRef } from 'react';
 
 export default function Logs() {
   const [logs, setLogs] = useState([
-    // Mock logs для демонстрації
     { id: 1, level: 'INFO', message: 'Scheduler запущено', timestamp: new Date().toISOString() },
-    { id: 2, level: 'INFO', message: 'Початок парсингу example.com', timestamp: new Date().toISOString() },
-    { id: 3, level: 'ERROR', message: 'Помилка підключення до proxy', timestamp: new Date().toISOString() },
-    { id: 4, level: 'INFO', message: 'Знайдено 5 угод на test.com', timestamp: new Date().toISOString() },
-    { id: 5, level: 'DEBUG', message: 'Gemini API response: 200 OK', timestamp: new Date().toISOString() },
+    { id: 2, level: 'INFO', message: 'Очікування подій парсингу...', timestamp: new Date().toISOString() },
+    { id: 3, level: 'INFO', message: 'Логи оновлюються при запуску парсингу', timestamp: new Date().toISOString() },
   ]);
   const [filter, setFilter] = useState('all');
   const [autoScroll, setAutoScroll] = useState(true);
@@ -30,6 +27,7 @@ export default function Logs() {
         'Celery worker ready',
         'Gemini API quota warning',
         'Proxy rotated successfully',
+        'Завантажено HTML для домену',
       ];
       
       const newLog = {

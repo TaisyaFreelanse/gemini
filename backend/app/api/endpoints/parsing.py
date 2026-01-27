@@ -155,26 +155,66 @@ async def start_parsing(
         # Получаем настройки из Redis (если есть) или из settings
         gemini_key_redis = redis_client.get("config:gemini_key")
         gemini_key = gemini_key_redis.decode() if gemini_key_redis else settings.GEMINI_API_KEY
-        
-        proxy_host_redis = redis_client.get("config:proxy_host")
-        proxy_host = proxy_host_redis.decode() if proxy_host_redis else settings.PROXY_HOST
-        
-        proxy_login_redis = redis_client.get("config:proxy_login")
-        proxy_login = proxy_login_redis.decode() if proxy_login_redis else settings.PROXY_LOGIN
-        
-        proxy_password_redis = redis_client.get("config:proxy_password")
-        proxy_password = proxy_password_redis.decode() if proxy_password_redis else settings.PROXY_PASSWORD
-        
+
+        # Проксі: спочатку config:proxy (JSON), потім config:proxy_*, потім settings
+        proxy_host = None
+        proxy_login = None
+        proxy_password = None
+        proxy_http_port = settings.PROXY_HTTP_PORT
+        proxy_socks_port = settings.PROXY_SOCKS_PORT
+        config_proxy_raw = redis_client.get("config:proxy")
+        if config_proxy_raw:
+            try:
+                import json
+                p = json.loads(config_proxy_raw.decode())
+                proxy_host = p.get("host") or None
+                proxy_login = p.get("login") or None
+                proxy_password = p.get("password") or None
+                proxy_http_port = p.get("http_port", settings.PROXY_HTTP_PORT)
+                proxy_socks_port = p.get("socks_port", settings.PROXY_SOCKS_PORT)
+            except Exception:
+                pass
+        if proxy_host is None:
+            ph = redis_client.get("config:proxy_host")
+            proxy_host = ph.decode() if ph else settings.PROXY_HOST
+        if proxy_login is None:
+            pl = redis_client.get("config:proxy_login")
+            proxy_login = pl.decode() if pl else settings.PROXY_LOGIN
+        if proxy_password is None:
+            pp = redis_client.get("config:proxy_password")
+            proxy_password = pp.decode() if pp else settings.PROXY_PASSWORD
+        try:
+            pport = redis_client.get("config:proxy_http_port")
+            if pport:
+                proxy_http_port = int(pport.decode())
+        except Exception:
+            pass
+        try:
+            psport = redis_client.get("config:proxy_socks_port")
+            if psport:
+                proxy_socks_port = int(psport.decode())
+        except Exception:
+            pass
+
+        prompt_redis = redis_client.get("config:prompt")
+        prompt_template = prompt_redis.decode() if prompt_redis else None
+
+        webhook_url_raw = redis_client.get("config:webhook_url")
+        webhook_url = webhook_url_raw.decode() if webhook_url_raw else settings.WEBHOOK_URL
+        webhook_token_raw = redis_client.get("config:webhook_token")
+        webhook_token = webhook_token_raw.decode() if webhook_token_raw else settings.WEBHOOK_TOKEN
+
         config = {
             'gemini_key': gemini_key,
+            'prompt': prompt_template,
             'webhook': {
-                'url': settings.WEBHOOK_URL,
-                'token': settings.WEBHOOK_TOKEN
+                'url': webhook_url,
+                'token': webhook_token
             },
             'proxy': {
                 'host': proxy_host,
-                'http_port': settings.PROXY_HTTP_PORT,
-                'socks_port': settings.PROXY_SOCKS_PORT,
+                'http_port': proxy_http_port,
+                'socks_port': proxy_socks_port,
                 'login': proxy_login,
                 'password': proxy_password
             } if proxy_host else None
@@ -224,63 +264,9 @@ async def stop_parsing(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/status", response_model=ParsingStatusResponse)
-async def get_parsing_status(db: Session = Depends(get_db)):
-    """
-    Отримати статус поточного процесу парсингу з реальними даними з БД
-    """
-    from app.db import crud
-    from datetime import datetime, timedelta
-    
-    current_status = redis_client.get("scraping:status")
-    status_str = current_status.decode() if current_status else "idle"
-    
-    # Отримуємо ID поточної сесії
-    session_id_raw = redis_client.get("scraping:session_id")
-    session_id = int(session_id_raw.decode()) if session_id_raw else None
-    
-    # Якщо є активна сесія, отримуємо дані з БД
-    if session_id:
-        session = crud.get_scraping_session(db, session_id)
-        if session:
-            total = session.total_domains or 0
-            processed = session.processed_domains or 0
-            successful = session.successful_domains or 0
-            failed = session.failed_domains or 0
-            
-            # Розраховуємо прогрес
-            progress_percent = (processed / total * 100) if total > 0 else 0.0
-            
-            # Розраховуємо швидкість
-            if session.started_at:
-                duration = (datetime.utcnow() - session.started_at).total_seconds() / 3600
-                domains_per_hour = processed / duration if duration > 0 else 0.0
-            else:
-                domains_per_hour = 0.0
-            
-            # Оцінка завершення
-            if processed > 0 and total > processed:
-                remaining = total - processed
-                estimated_completion = datetime.utcnow() + timedelta(
-                    hours=remaining / domains_per_hour if domains_per_hour > 0 else 1
-                )
-            else:
-                estimated_completion = session.completed_at or datetime.utcnow()
-            
-            return ParsingStatusResponse(
-                session_id=session_id,
-                status=ScrapingStatus(session.status or status_str),
-                total_domains=total,
-                processed_domains=processed,
-                successful_domains=successful,
-                failed_domains=failed,
-                progress_percent=round(progress_percent, 1),
-                domains_per_hour=round(domains_per_hour, 1),
-                started_at=session.started_at or datetime.utcnow(),
-                estimated_completion=estimated_completion
-            )
-    
-    # Якщо немає активної сесії, повертаємо порожній статус
+def _idle_status() -> ParsingStatusResponse:
+    """Повернути порожній статус (idle). Використовується при помилках або відсутності сесії."""
+    from datetime import datetime
     return ParsingStatusResponse(
         session_id=0,
         status=ScrapingStatus("idle"),
@@ -293,6 +279,76 @@ async def get_parsing_status(db: Session = Depends(get_db)):
         started_at=datetime.utcnow(),
         estimated_completion=datetime.utcnow()
     )
+
+
+@router.get("/status", response_model=ParsingStatusResponse)
+async def get_parsing_status(db: Session = Depends(get_db)):
+    """
+    Отримати статус поточного процесу парсингу з реальними даними з БД
+    """
+    import logging
+    from app.db import crud
+    from datetime import datetime, timedelta
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        current_status = redis_client.get("scraping:status")
+        status_str = current_status.decode() if current_status else "idle"
+    except Exception as e:
+        logger.warning("Redis unavailable in /status: %s", e)
+        return _idle_status()
+
+    try:
+        session_id_raw = redis_client.get("scraping:session_id")
+        session_id = int(session_id_raw.decode()) if session_id_raw else None
+    except Exception as e:
+        logger.warning("Redis session_id read failed: %s", e)
+        session_id = None
+
+    if session_id:
+        try:
+            session = crud.get_scraping_session(db, session_id)
+        except Exception as e:
+            logger.warning("DB error in get_parsing_status: %s", e)
+            return _idle_status()
+
+        if session:
+            total = session.total_domains or 0
+            processed = session.processed_domains or 0
+            successful = session.successful_domains or 0
+            failed = session.failed_domains or 0
+
+            progress_percent = (processed / total * 100) if total > 0 else 0.0
+
+            if session.started_at:
+                duration = (datetime.utcnow() - session.started_at).total_seconds() / 3600
+                domains_per_hour = processed / duration if duration > 0 else 0.0
+            else:
+                domains_per_hour = 0.0
+
+            if processed > 0 and total > processed and domains_per_hour > 0:
+                remaining = total - processed
+                estimated_completion = datetime.utcnow() + timedelta(
+                    hours=remaining / domains_per_hour
+                )
+            else:
+                estimated_completion = session.completed_at or datetime.utcnow()
+
+            return ParsingStatusResponse(
+                session_id=session_id,
+                status=ScrapingStatus(session.status or status_str),
+                total_domains=total,
+                processed_domains=processed,
+                successful_domains=successful,
+                failed_domains=failed,
+                progress_percent=round(progress_percent, 1),
+                domains_per_hour=round(domains_per_hour, 1),
+                started_at=session.started_at or datetime.utcnow(),
+                estimated_completion=estimated_completion
+            )
+
+    return _idle_status()
 
 
 @router.get("/progress/{session_id}", response_model=ParsingStatusResponse)

@@ -3,15 +3,17 @@ from typing import Optional
 
 
 class ConfigResponse(BaseModel):
-    """Відповідь з усіма налаштуваннями"""
-    api_url: Optional[str] = None
-    gemini_key: str = "***"  # Приховуємо ключ
+    """Відповідь з усіма налаштуваннями (контракт з фронтом: domains_api_url, gemini_prompt тощо)."""
+    domains_api_url: Optional[str] = None
+    gemini_api_key: str = ""  # Фронт показує порожнє або "***"; при збереженні передає ключ
+    gemini_prompt: Optional[str] = None
     webhook_url: Optional[str] = None
-    webhook_token: str = "***"  # Приховуємо токен
+    webhook_token: str = ""
     proxy_host: Optional[str] = None
     proxy_http_port: int = 59100
     proxy_socks_port: int = 59101
     proxy_login: Optional[str] = None
+    proxy_password: str = ""
     scraping_timeout: int = 30
     celery_workers: int = 10
 
@@ -50,3 +52,17 @@ class ConfigUpdateResponse(BaseModel):
     """Відповідь на оновлення конфігурації"""
     success: bool
     message: str
+
+
+class FullConfigUpdate(BaseModel):
+    """Повна конфігурація з фронту (один PUT /config). Всі поля опційні."""
+    domains_api_url: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_prompt: Optional[str] = None
+    webhook_url: Optional[str] = None
+    webhook_token: Optional[str] = None
+    proxy_host: Optional[str] = None
+    proxy_http_port: Optional[int] = None
+    proxy_socks_port: Optional[int] = None
+    proxy_login: Optional[str] = None
+    proxy_password: Optional[str] = None

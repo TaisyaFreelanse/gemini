@@ -16,6 +16,10 @@ import io
 router = APIRouter()
 
 
+def _empty_detailed_report() -> DetailedReport:
+    return DetailedReport(domains=[], total=0)
+
+
 @router.get("", response_model=DetailedReport)
 @router.get("/", response_model=DetailedReport)
 async def get_reports_root(
@@ -28,12 +32,13 @@ async def get_reports_root(
     """
     Базовий endpoint - повертає список доменів з реальними даними з БД
     """
-    from app.db import crud
+    import logging
     from sqlalchemy import func, case
     from app.models.scraped_deal import ScrapedDeal
     from app.models.scraping_session import ScrapingSession
-    
-    # Отримуємо угоди з БД з групуванням по доменам
+
+    logger = logging.getLogger(__name__)
+
     try:
         query = db.query(
             ScrapedDeal.domain,
@@ -43,47 +48,33 @@ async def get_reports_root(
             func.max(case((ScrapedDeal.webhook_sent == True, 1), else_=0)).label('webhook_sent'),
             func.count(case((ScrapedDeal.webhook_sent == False, 1))).label('webhook_pending')
         ).group_by(ScrapedDeal.domain, ScrapedDeal.session_id)
-    except Exception as e:
-        # Если таблица не существует или нет данных, возвращаем пустой список
-        return DetailedReport(
-            domains=[],
-            total=0
-        )
-    
-    # Фільтри
-    if domain:
-        query = query.filter(ScrapedDeal.domain.ilike(f"%{domain}%"))
-    
-    # Підрахунок загальної кількості
-    total = query.count()
-    
-    # Пагінація
-    results = query.order_by(func.max(ScrapedDeal.created_at).desc()).offset(skip).limit(limit).all()
-    
-    # Формуємо список доменів з результатами
-    domain_reports = []
-    for result in results:
-        # Визначаємо статус: успішний якщо є угоди
-        success = result.deals_count > 0
-        
-        domain_reports.append(
-            DomainReport(
-                domain=result.domain,
-                session_id=result.session_id,
-                deals_count=result.deals_count,
-                success=success,
-                scraped_at=result.scraped_at,
-                webhook_sent=bool(result.webhook_sent),
-                error_count=0 if success else 1,
-                last_error=None if success else "No deals found"
+
+        if domain:
+            query = query.filter(ScrapedDeal.domain.ilike(f"%{domain}%"))
+
+        total = query.count()
+        results = query.order_by(func.max(ScrapedDeal.created_at).desc()).offset(skip).limit(limit).all()
+
+        domain_reports = []
+        for result in results:
+            success = result.deals_count > 0
+            domain_reports.append(
+                DomainReport(
+                    domain=result.domain,
+                    session_id=result.session_id,
+                    deals_count=result.deals_count,
+                    success=success,
+                    scraped_at=result.scraped_at,
+                    webhook_sent=bool(result.webhook_sent),
+                    error_count=0 if success else 1,
+                    last_error=None if success else "No deals found"
+                )
             )
-        )
-    
-    # Якщо немає даних в БД, повертаємо порожній список (не mock)
-    return DetailedReport(
-        domains=domain_reports,
-        total=total
-    )
+
+        return DetailedReport(domains=domain_reports, total=total)
+    except Exception as e:
+        logger.warning("Reports root error: %s", e)
+        return _empty_detailed_report()
 
 
 @router.get("/summary", response_model=ReportSummary)

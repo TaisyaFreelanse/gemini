@@ -116,7 +116,11 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
     # Крок 2: Аналізуємо через Gemini AI
     try:
         gemini_key = config.get('gemini_key')
-        gemini = GeminiService(api_key=gemini_key) if gemini_key else GeminiService()
+        prompt_template = config.get('prompt')
+        gemini = GeminiService(
+            api_key=gemini_key or None,
+            prompt_template=prompt_template
+        )
         
         logger.info(f"Аналіз через Gemini AI для {domain}...")
         deals, error, metadata = await gemini.extract_deals_from_scraped_data(scraped_data)

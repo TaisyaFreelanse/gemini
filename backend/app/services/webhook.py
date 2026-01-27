@@ -332,10 +332,11 @@ class WebhookService:
         """
         if not config:
             return cls()
-        
+        url = config.get('webhook_url') or config.get('url')
+        token = config.get('webhook_token') or config.get('token')
         return cls(
-            webhook_url=config.get('webhook_url'),
-            webhook_token=config.get('webhook_token'),
+            webhook_url=url,
+            webhook_token=token,
             max_retries=config.get('max_retries', 3),
             timeout=config.get('timeout', 30)
         )
