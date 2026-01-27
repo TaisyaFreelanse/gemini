@@ -260,3 +260,5 @@ api_keys.txt
 !examples/**
 !templates/**
 *.md
+# Local / embedded tools
+hub-mcp/
