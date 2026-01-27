@@ -200,6 +200,9 @@ dmypy.json
 # ====================
 # Project Specific
 # ====================
+# Embedded git repo (Docker Hub MCP)
+hub-mcp/
+
 # Test results
 TEST_RESULTS.md
 
