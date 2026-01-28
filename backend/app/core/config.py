@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # Gemini AI
     GEMINI_API_KEY: str
     GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MAX_CONTENT_LENGTH: int = 80000  # max chars HTML/email перед відправкою (0 = без обрізки)
     
     # Domains API
     DOMAINS_API_URL: Optional[str] = None

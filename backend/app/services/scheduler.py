@@ -106,21 +106,24 @@ class SchedulerService:
             - "*/30 * * * *" - кожні 30 хвилин
         """
         try:
-            # Парсимо cron expression
-            parts = cron_expression.split()
+            # Парсимо cron expression (5 полів: minute hour day month day_of_week)
+            raw = (cron_expression or "").strip()
+            parts = raw.split()
+            # Нормалізація: якщо 4 поля — додати day_of_week=*
+            if len(parts) == 4:
+                parts.append('*')
+            if len(parts) == 1:
+                if parts[0] == '*' or parts[0].lower() == 'every_minute':
+                    parts = ['*', '*', '*', '*', '*']  # кожну хвилину
+                else:
+                    parts = [parts[0], '*', '*', '*', '*']  # хв N щогодини
             if len(parts) != 5:
-                raise ValueError("Cron expression має містити 5 частин: minute hour day month day_of_week")
-            
-            minute, hour, day, month, day_of_week = parts
-            
-            trigger = CronTrigger(
-                minute=minute,
-                hour=hour,
-                day=day,
-                month=month,
-                day_of_week=day_of_week,
-                timezone='UTC'
-            )
+                raise ValueError(
+                    "Cron має 5 полів: minute hour day month day_of_week. "
+                    "Приклад: * * * * * (кожну хв), */5 * * * * (кожні 5 хв), 0 */6 * * * (кожні 6 год)"
+                )
+            expr = ' '.join(parts)
+            trigger = CronTrigger.from_crontab(expr, timezone='UTC')
             
             job = self.scheduler.add_job(
                 func=func,

@@ -5,6 +5,7 @@ import asyncio
 from typing import List, Dict, Optional, Tuple
 from app.schemas.deals import DealSchema
 from app.core.config import settings
+from app.prompts import EMAIL_DEALS_PROMPT
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -115,91 +116,158 @@ HTML контент сайту {domain}:
         Returns:
             Готовий промпт
         """
-        # Обмежуємо розмір HTML (Gemini має ліміт токенів)
-        max_html_length = 50000
-        if len(html_content) > max_html_length:
-            html_content = html_content[:max_html_length] + "\n...(контент обрізано)"
+        max_len = getattr(settings, "GEMINI_MAX_CONTENT_LENGTH", 80000) or 0
+        if max_len and len(html_content) > max_len:
+            orig_len = len(html_content)
+            html_content = html_content[:max_len] + "\n...(контент обрізано)"
+            logger.warning(
+                f"[Gemini] HTML обрізано для {domain!r}: orig={orig_len} max={max_len} (GEMINI_MAX_CONTENT_LENGTH)"
+            )
         
         return self.prompt_template.format(
             domain=domain,
             html_content=html_content
         )
+
+    def _prepare_email_prompt(self, email_body: str, domain: str) -> str:
+        """
+        Підготувати промпт для листа (email); placeholder [EMAIL], {domain}.
+        Обрізає тіло листа до GEMINI_MAX_CONTENT_LENGTH при потребі.
+        """
+        max_len = getattr(settings, "GEMINI_MAX_CONTENT_LENGTH", 80000) or 0
+        body = email_body
+        if max_len and len(body) > max_len:
+            orig_len = len(body)
+            body = body[:max_len] + "\n...(контент обрізано)"
+            logger.warning(
+                f"[Gemini] Тіло листа обрізано для {domain!r}: orig={orig_len} max={max_len} (GEMINI_MAX_CONTENT_LENGTH)"
+            )
+        return EMAIL_DEALS_PROMPT.replace("[EMAIL]", body).replace("{domain}", domain)
+    
+    def _get_response_text(self, response) -> str:
+        """Безпечно отримати текст з відповіді Gemini (SDK іноді кидає при .text)."""
+        if response is None:
+            return ""
+        try:
+            if hasattr(response, "text") and response.text is not None:
+                return str(response.text).strip()
+        except Exception as e:
+            logger.debug(f"response.text виняток: {type(e).__name__}: {e}")
+        try:
+            if hasattr(response, "candidates") and response.candidates:
+                c = response.candidates[0]
+                if hasattr(c, "content") and c.content and hasattr(c.content, "parts") and c.content.parts:
+                    parts = c.content.parts
+                    texts = [getattr(p, "text", None) or getattr(p, "inline_data", str(p)) for p in parts]
+                    return (" ".join(str(t) for t in texts if t)).strip()
+        except Exception as e:
+            logger.debug(f"candidates/parts виняток: {type(e).__name__}: {e}")
+        return ""
+
+    def _log_response_diagnostics(self, response, domain: str, response_text: str, context: str = "empty_or_blocked"):
+        """Логувати діагностику відповіді Gemini без PII (при порожньому тексті / блоці)."""
+        try:
+            parts = []
+            parts.append(f"[Gemini diag] domain={domain!r} context={context!r} text_len={len(response_text or '')}")
+            if response is None:
+                parts.append("response=None")
+                logger.warning(" ".join(parts))
+                return
+            if hasattr(response, "prompt_feedback"):
+                pf = response.prompt_feedback
+                if pf is not None:
+                    block = getattr(pf, "block_reason", None)
+                    parts.append(f"prompt_feedback.block_reason={block}")
+            if hasattr(response, "candidates") and response.candidates:
+                for i, c in enumerate(response.candidates[:2]):
+                    fr = getattr(c, "finish_reason", None)
+                    parts.append(f"candidates[{i}].finish_reason={fr}")
+                    if hasattr(c, "safety_ratings") and c.safety_ratings:
+                        parts.append(f"candidates[{i}].safety_ratings={list(c.safety_ratings)[:4]!r}")
+            raw_preview = (response_text or "")[:300].replace("\n", " ").strip()
+            if not raw_preview:
+                raw_preview = "[empty]"
+            parts.append(f"raw_preview={raw_preview!r}")
+            logger.warning(" ".join(parts))
+        except Exception as e:
+            logger.warning(f"[Gemini diag] domain={domain!r} diagnostic failed: {type(e).__name__}: {e}")
     
     def _parse_json_response(self, response_text: str) -> List[Dict]:
         """
-        Розпарсити JSON відповідь від Gemini
-        
-        Args:
-            response_text: Текст відповіді від Gemini
-        
-        Returns:
-            Список словників з даними про акції
+        Розпарсити JSON відповідь від Gemini.
+        Підтримує масив [...], об'єкт {"deals": [...]} / {"data": [...]}, markdown блоки.
         """
-        # Видаляємо можливі markdown блоки
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        response_text = response_text.strip()
-        
-        # Пробуємо знайти JSON в тексті (може бути обгорнутий в текст)
         import re
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            response_text = json_match.group(0)
-        
-        try:
-            data = json.loads(response_text)
-            
-            # Перевіряємо що це список
-            if not isinstance(data, list):
-                logger.warning("Відповідь від Gemini не є масивом, загортаємо в масив")
-                data = [data] if data else []
-            
-            return data
-        
-        except json.JSONDecodeError as e:
-            logger.error(f"Помилка парсингу JSON: {e}")
-            logger.error(f"Сира відповідь (перші 1000 символів): {response_text[:1000]}")
-            # Пробуємо витягнути хоча б частину JSON
+        if not response_text or not isinstance(response_text, str):
+            return []
+        raw = response_text.strip()
+        # Прибираємо markdown
+        for prefix in ("```json", "```"):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):].strip()
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+        raw = raw.strip()
+        if not raw:
+            return []
+
+        def as_list(obj) -> List[Dict]:
+            if isinstance(obj, list):
+                return [x for x in obj if isinstance(x, dict)]
+            if isinstance(obj, dict):
+                for key in ("deals", "data", "items", "results"):
+                    if key in obj and isinstance(obj[key], list):
+                        return [x for x in obj[key] if isinstance(x, dict)]
+                return []
+            return []
+
+        # Спочатку шукаємо масив [...]
+        m = re.search(r'\[[\s\S]*\]', raw)
+        if m:
             try:
-                # Шукаємо перший [ і останній ]
-                start = response_text.find('[')
-                end = response_text.rfind(']')
-                if start >= 0 and end > start:
-                    partial_json = response_text[start:end+1]
-                    data = json.loads(partial_json)
-                    if isinstance(data, list):
-                        logger.info(f"Вдалося витягнути частковий JSON: {len(data)} елементів")
-                        return data
-            except:
+                data = json.loads(m.group(0))
+                out = as_list(data)
+                if out:
+                    return out
+            except json.JSONDecodeError:
                 pass
+        # Потім об'єкт {...}
+        m = re.search(r'\{[\s\S]*\}', raw)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                out = as_list(data)
+                if out:
+                    return out
+            except json.JSONDecodeError:
+                pass
+        # Прямий парс
+        try:
+            data = json.loads(raw)
+            return as_list(data)
+        except json.JSONDecodeError:
             return []
     
     def _validate_deals(self, deals_data: List[Dict]) -> Tuple[List[DealSchema], List[Dict]]:
         """
-        Валідувати дані через Pydantic схему
-        
-        Args:
-            deals_data: Список словників з даними
-        
-        Returns:
-            Tuple[valid_deals, invalid_deals]
+        Валідувати дані через Pydantic схему.
+        Ігнорує не-словники, ловить будь-які помилки валідації.
         """
         valid_deals = []
         invalid_deals = []
-        
         for idx, deal_dict in enumerate(deals_data):
+            if not isinstance(deal_dict, dict):
+                invalid_deals.append({"data": deal_dict, "error": "не словник"})
+                continue
             try:
                 deal = DealSchema(**deal_dict)
                 valid_deals.append(deal)
-            except ValidationError as e:
+            except (ValidationError, TypeError, ValueError, KeyError) as e:
                 logger.warning(f"Невалідна угода #{idx}: {e}")
                 invalid_deals.append({"data": deal_dict, "error": str(e)})
-        
+            except Exception as e:
+                logger.warning(f"Угода #{idx} — неочікувана помилка: {e}")
+                invalid_deals.append({"data": deal_dict, "error": str(e)})
         return valid_deals, invalid_deals
     
     async def extract_deals(
@@ -226,74 +294,92 @@ HTML контент сайту {domain}:
             "invalid_deals_count": 0,
             "parse_error": None
         }
-        
-        # Підготовка промпту
-        prompt = self._prepare_prompt(html_content, domain)
-        
-        # Спроби з retry logic
+        _friendly_shop_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
+
+        try:
+            prompt = self._prepare_prompt(html_content, domain)
+        except Exception as e:
+            if "shop" in str(e).lower() or '"shop"' in str(e):
+                return [], _friendly_shop_msg, metadata
+            raise
+        return await self._extract_deals_core(prompt, domain)
+
+    async def _extract_deals_core(
+        self, prompt: str, domain: str
+    ) -> Tuple[List[DealSchema], Optional[str], Dict]:
+        """Спільна логіка: запит до Gemini, парсинг JSON, валідація угод (для HTML та email)."""
+        metadata = {
+            "attempts": 0,
+            "raw_response": None,
+            "invalid_deals_count": 0,
+            "parse_error": None,
+        }
+        _friendly_shop_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
+
         for attempt in range(1, self.max_retries + 1):
             metadata["attempts"] = attempt
-            
             try:
                 logger.info(f"Спроба {attempt}/{self.max_retries}: Відправка запиту до Gemini для {domain}")
-                
-                # Відправляємо запит до Gemini (синхронний API)
-                # Використовуємо run_in_executor для асинхронності
                 loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    self.model.generate_content,
-                    prompt
-                )
-                
-                # Отримуємо текст відповіді
-                response_text = response.text
-                metadata["raw_response"] = response_text[:2000]  # Зберігаємо перші 2000 символів
-                
+                response = await loop.run_in_executor(None, self.model.generate_content, prompt)
+                response_text = self._get_response_text(response)
+                metadata["raw_response"] = (response_text or "")[:2000]
+
+                if not (response_text or "").strip():
+                    self._log_response_diagnostics(response, domain, response_text or "", "empty_or_blocked")
                 logger.info(f"✓ Отримано відповідь від Gemini ({len(response_text)} символів)")
-                logger.debug(f"Перші 500 символів відповіді: {response_text[:500]}")
-                
-                # Парсимо JSON
+                if response_text:
+                    logger.debug(f"Перші 500 символів відповіді: {response_text[:500]}")
+
                 deals_data = self._parse_json_response(response_text)
-                
                 if not deals_data:
                     logger.info(f"Gemini не знайшов жодної акції на {domain}")
                     return [], None, metadata
-                
-                # Валідуємо дані
                 valid_deals, invalid_deals = self._validate_deals(deals_data)
                 metadata["invalid_deals_count"] = len(invalid_deals)
-                
                 if invalid_deals:
                     logger.warning(f"Відкинуто {len(invalid_deals)} невалідних угод")
-                
                 logger.info(f"✓ Успішно витягнуто {len(valid_deals)} валідних угод з {domain}")
                 return valid_deals, None, metadata
-            
+
+            except (ValueError, KeyError, AttributeError) as e:
+                err = str(e).strip()
+                error_msg = _friendly_shop_msg if ('"shop"' in err or err in ('\n    "shop"', '"shop"', "'shop'")) else f"Gemini SDK: {type(e).__name__}: {err[:200]}"
+                logger.error(error_msg)
+                metadata["parse_error"] = error_msg
+                if attempt >= self.max_retries:
+                    return [], error_msg, metadata
+                await asyncio.sleep(2 ** attempt)
+                logger.info(f"Чекаємо {2 ** attempt}с перед повтором...")
             except json.JSONDecodeError as e:
                 error_msg = f"Помилка парсингу JSON: {str(e)}"
                 logger.error(error_msg)
                 metadata["parse_error"] = error_msg
-                
-                if attempt < self.max_retries:
-                    wait_time = 2 ** attempt  # Exponential backoff: 2s, 4s, 8s
-                    logger.info(f"Чекаємо {wait_time}с перед наступною спробою...")
-                    await asyncio.sleep(wait_time)
-                else:
+                if attempt >= self.max_retries:
                     return [], error_msg, metadata
-            
+                await asyncio.sleep(2 ** attempt)
+                logger.info(f"Чекаємо {2 ** attempt}с перед наступною спробою...")
             except Exception as e:
-                error_msg = f"Помилка Gemini API: {str(e)}"
+                s = str(e).strip()
+                error_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)" if ('"shop"' in s or (s and "shop" in s and len(s) < 30)) else f"Gemini API: {type(e).__name__}: {s[:180]}"
                 logger.error(error_msg, exc_info=True)
-                
-                if attempt < self.max_retries:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Чекаємо {wait_time}с перед наступною спробою...")
-                    await asyncio.sleep(wait_time)
-                else:
+                metadata["parse_error"] = error_msg
+                if attempt >= self.max_retries:
                     return [], error_msg, metadata
-        
+                await asyncio.sleep(2 ** attempt)
+                logger.info(f"Чекаємо {2 ** attempt}с перед повтором...")
+
         return [], "Не вдалося витягнути дані після всіх спроб", metadata
+
+    async def extract_deals_from_email(
+        self, email_body: str, domain: str
+    ) -> Tuple[List[DealSchema], Optional[str], Dict]:
+        """
+        Витягнути угоди з тіла листа (email) за промптом для coupon website (French).
+        Використовує DEFAULT_EMAIL_PROMPT з плейсхолдерами [EMAIL] та {domain}.
+        """
+        prompt = self._prepare_email_prompt(email_body, domain)
+        return await self._extract_deals_core(prompt, domain)
     
     async def extract_deals_from_scraped_data(
         self,
@@ -317,5 +403,12 @@ HTML контент сайту {domain}:
         
         if not clean_html:
             return [], "Немає HTML контенту для аналізу", {}
-        
-        return await self.extract_deals(clean_html, domain)
+
+        _friendly = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
+        try:
+            return await self.extract_deals(clean_html, domain)
+        except Exception as e:
+            s = str(e).strip()
+            if '"shop"' in s or s in ('\n    "shop"', '"shop"', "'shop'") or ("shop" in s and len(s) < 50):
+                return [], _friendly, {"parse_error": _friendly}
+            raise

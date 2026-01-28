@@ -100,7 +100,8 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         scraper = WebScraper.create_with_config(proxy_config) if proxy_config else WebScraper()
         
         logger.info(f"Завантаження HTML для {domain}...")
-        scraped_data = await scraper.scrape_domain(domain, use_proxy=bool(proxy_config))
+        # use_cache=False — async Redis кеш дає "Event loop is closed" у Celery
+        scraped_data = await scraper.scrape_domain(domain, use_proxy=bool(proxy_config), use_cache=False)
         
         if not scraped_data['success']:
             result['error'] = scraped_data.get('error', 'Scraping failed')
@@ -138,8 +139,13 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         logger.info(f"✓ Знайдено {len(deals)} угод для {domain}")
         
     except Exception as e:
-        logger.error(f"Помилка Gemini для {domain}: {e}")
-        result['error'] = f"Gemini error: {str(e)}"
+        err_s = str(e).strip()
+        if '"shop"' in err_s or err_s in ('\n    "shop"', '"shop"', "'shop'"):
+            msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
+        else:
+            msg = f"Gemini error: {err_s[:200]}"
+        logger.error(f"Помилка Gemini для {domain}: {msg}")
+        result['error'] = msg
         return result
     
     # Крок 3: Зберігаємо результат в БД та Redis

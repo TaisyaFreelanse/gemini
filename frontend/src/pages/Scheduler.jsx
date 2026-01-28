@@ -8,7 +8,7 @@ export default function Scheduler() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newJob, setNewJob] = useState({
     job_id: '',
-    cron_expression: '0 */6 * * *',
+    cron_expression: '* * * * *',  // кожну хвилину — для тесту
     job_type: 'full_scraping',
     domains: '',
     batch_size: 500,
@@ -64,7 +64,7 @@ export default function Scheduler() {
       setShowAddForm(false);
       setNewJob({
         job_id: '',
-        cron_expression: '0 */6 * * *',
+        cron_expression: '* * * * *',
         job_type: 'full_scraping',
         domains: '',
         batch_size: 500,
@@ -111,10 +111,12 @@ export default function Scheduler() {
   }
 
   const cronExamples = [
+    { label: 'Кожну хвилину (тест)', value: '* * * * *' },
+    { label: 'Кожні 5 хвилин', value: '*/5 * * * *' },
+    { label: 'Кожні 30 хвилин', value: '*/30 * * * *' },
     { label: 'Кожні 6 годин', value: '0 */6 * * *' },
     { label: 'Кожні 2 години', value: '0 */2 * * *' },
     { label: 'Щодня о 00:00', value: '0 0 * * *' },
-    { label: 'Кожні 30 хвилин', value: '*/30 * * * *' },
     { label: 'Понеділок о 9:00', value: '0 9 * * 1' },
   ];
 
@@ -208,7 +210,7 @@ export default function Scheduler() {
                   value={newJob.cron_expression}
                   onChange={(e) => setNewJob({...newJob, cron_expression: e.target.value})}
                   className="flex-1 px-3 py-2 border border-gray-300 rounded-md font-mono"
-                  placeholder="0 */6 * * *"
+                  placeholder="* * * * * (5 полів: хв год день міс тижд)"
                   required
                 />
                 <select
