@@ -105,7 +105,16 @@ class WebScraper:
 
                 # Виконуємо HTTP запит
                 headers = self._get_headers(url)
-                async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                
+                # Вимикаємо перевірку SSL при використанні проксі (часто потрібно для datacenter проксі)
+                import ssl
+                ssl_context = ssl.create_default_context()
+                if proxy_base_url:
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                async with aiohttp.ClientSession(timeout=self.timeout, connector=connector) as session:
                     kwargs = {'headers': headers}
                     if proxy_base_url:
                         kwargs['proxy'] = proxy_base_url
