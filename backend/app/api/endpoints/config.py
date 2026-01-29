@@ -75,21 +75,40 @@ async def update_config_full(body: FullConfigUpdate, db: Session = Depends(get_d
         redis_client.set("config:webhook_url", body.webhook_url or "")
     if body.webhook_token is not None and (body.webhook_token.strip() not in ("", "***") if body.webhook_token else False):
         redis_client.set("config:webhook_token", body.webhook_token.strip())
+    # Proxy: зберігаємо тільки якщо є непусте значення, щоб не перебивати .env
     if body.proxy_host is not None or body.proxy_http_port is not None or body.proxy_socks_port is not None or body.proxy_login is not None or body.proxy_password is not None:
-        ph = body.proxy_host if body.proxy_host is not None else _redis_str("config:proxy_host") or settings.PROXY_HOST
+        # Отримуємо поточні значення (з Redis, потім з .env)
+        ph = body.proxy_host.strip() if body.proxy_host and body.proxy_host.strip() else None
+        if ph is None:
+            ph = _redis_str("config:proxy_host") or settings.PROXY_HOST or None
+        
         pport = body.proxy_http_port if body.proxy_http_port is not None else _redis_int("config:proxy_http_port", settings.PROXY_HTTP_PORT)
         psport = body.proxy_socks_port if body.proxy_socks_port is not None else _redis_int("config:proxy_socks_port", settings.PROXY_SOCKS_PORT)
-        plogin = body.proxy_login if body.proxy_login is not None else (_redis_str("config:proxy_login") or settings.PROXY_LOGIN)
+        
+        plogin = body.proxy_login.strip() if body.proxy_login and body.proxy_login.strip() else None
+        if plogin is None:
+            plogin = _redis_str("config:proxy_login") or settings.PROXY_LOGIN or None
+        
         _pass = body.proxy_password
         if _pass is None or (isinstance(_pass, str) and _pass.strip() in ("", "***")):
             _pass = _redis_str("config:proxy_password") or settings.PROXY_PASSWORD
-        ppass = _pass or ""
-        redis_client.set("config:proxy", json.dumps({"host": ph or "", "http_port": pport, "socks_port": psport, "login": plogin or "", "password": ppass or ""}))
-        redis_client.set("config:proxy_host", ph or "")
-        redis_client.set("config:proxy_http_port", str(pport))
-        redis_client.set("config:proxy_socks_port", str(psport))
-        redis_client.set("config:proxy_login", plogin or "")
-        redis_client.set("config:proxy_password", ppass or "")
+        ppass = _pass.strip() if _pass else None
+        
+        # Зберігаємо тільки якщо є хоча б host
+        if ph:
+            redis_client.set("config:proxy", json.dumps({"host": ph, "http_port": pport, "socks_port": psport, "login": plogin or "", "password": ppass or ""}))
+            redis_client.set("config:proxy_host", ph)
+            redis_client.set("config:proxy_http_port", str(pport))
+            redis_client.set("config:proxy_socks_port", str(psport))
+            if plogin:
+                redis_client.set("config:proxy_login", plogin)
+            if ppass:
+                redis_client.set("config:proxy_password", ppass)
+        else:
+            # Якщо host пустий, видаляємо proxy конфіг з Redis (буде використано .env)
+            for k in ("config:proxy", "config:proxy_host", "config:proxy_http_port", 
+                      "config:proxy_socks_port", "config:proxy_login", "config:proxy_password"):
+                redis_client.delete(k)
     return ConfigUpdateResponse(success=True, message="Конфігурацію збережено")
 
 
@@ -98,6 +117,7 @@ CONFIG_KEYS = (
     "config:webhook_url", "config:webhook_token",
     "config:proxy", "config:proxy_host", "config:proxy_http_port",
     "config:proxy_socks_port", "config:proxy_login", "config:proxy_password",
+    "config:domains", "config:domains_count",
 )
 
 
@@ -110,6 +130,64 @@ async def reset_config(db: Session = Depends(get_db)):
         except Exception:
             pass
     return ConfigUpdateResponse(success=True, message="Конфігурацію скинуто до дефолтних значень")
+
+
+@router.get("/effective")
+async def get_effective_config(db: Session = Depends(get_db)):
+    """
+    Отримати ефективну конфігурацію (що реально буде використовуватися).
+    Показує звідки взято кожне значення: Redis чи .env
+    """
+    result = {}
+    
+    # Proxy
+    redis_proxy_host = _redis_str("config:proxy_host")
+    result["proxy"] = {
+        "host": {
+            "redis": redis_proxy_host or "(empty)",
+            "env": settings.PROXY_HOST or "(empty)",
+            "effective": redis_proxy_host or settings.PROXY_HOST or "(none)",
+            "source": "redis" if redis_proxy_host else "env"
+        },
+        "http_port": {
+            "redis": _redis_int("config:proxy_http_port", 0) or "(empty)",
+            "env": settings.PROXY_HTTP_PORT,
+            "effective": _redis_int("config:proxy_http_port", settings.PROXY_HTTP_PORT)
+        },
+        "login": {
+            "redis": _redis_str("config:proxy_login") or "(empty)",
+            "env": settings.PROXY_LOGIN or "(empty)",
+            "effective": _redis_str("config:proxy_login") or settings.PROXY_LOGIN or "(none)"
+        }
+    }
+    
+    # Gemini
+    result["gemini"] = {
+        "key_set_in_redis": bool(_redis_str("config:gemini_key")),
+        "key_set_in_env": bool(settings.GEMINI_API_KEY),
+        "model": settings.GEMINI_MODEL
+    }
+    
+    # Webhook
+    result["webhook"] = {
+        "url_redis": _redis_str("config:webhook_url") or "(empty)",
+        "url_env": settings.WEBHOOK_URL or "(empty)",
+        "effective": _redis_str("config:webhook_url") or settings.WEBHOOK_URL or "(none)"
+    }
+    
+    # Domains
+    domains_raw = redis_client.get("config:domains")
+    domains_count = 0
+    if domains_raw:
+        try:
+            domains_count = len(json.loads(domains_raw.decode()))
+        except:
+            pass
+    result["domains"] = {
+        "uploaded_count": domains_count
+    }
+    
+    return result
 
 
 @router.post("/test", response_model=ConfigUpdateResponse)
@@ -216,3 +294,120 @@ async def update_proxy(
         success=True,
         message="Proxy налаштування успішно оновлено"
     )
+
+
+# ========== Domains Management ==========
+
+@router.post("/domains/upload")
+async def upload_domains(data: dict, db: Session = Depends(get_db)):
+    """
+    Завантажити домени з JSON у форматі:
+    {
+        "status": true,
+        "message": "",
+        "data": ["domain1.com", "domain2.com", ...]
+    }
+    або просто масив: ["domain1.com", "domain2.com", ...]
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Підтримуємо обидва формати
+        if isinstance(data, dict):
+            if "data" in data and isinstance(data["data"], list):
+                domains = data["data"]
+            elif "domains" in data and isinstance(data["domains"], list):
+                domains = data["domains"]
+            else:
+                # Може бути просто масив в тілі
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Невірний формат. Очікується {data: [...]} або {domains: [...]}"
+                )
+        elif isinstance(data, list):
+            domains = data
+        else:
+            raise HTTPException(status_code=400, detail="Невірний формат даних")
+        
+        # Фільтруємо та валідуємо домени
+        valid_domains = []
+        for d in domains:
+            if isinstance(d, str) and d.strip():
+                domain = d.strip().lower()
+                # Видаляємо протокол якщо є
+                if domain.startswith("https://"):
+                    domain = domain[8:]
+                elif domain.startswith("http://"):
+                    domain = domain[7:]
+                # Видаляємо trailing slash
+                domain = domain.rstrip("/")
+                if domain and "." in domain:
+                    valid_domains.append(domain)
+        
+        # Видаляємо дублікати
+        valid_domains = list(dict.fromkeys(valid_domains))
+        
+        if not valid_domains:
+            raise HTTPException(status_code=400, detail="Не знайдено валідних доменів")
+        
+        # Зберігаємо в Redis
+        redis_client.set("config:domains", json.dumps(valid_domains))
+        redis_client.set("config:domains_count", str(len(valid_domains)))
+        
+        logger.info(f"Завантажено {len(valid_domains)} доменів")
+        
+        return {
+            "success": True,
+            "message": f"Успішно завантажено {len(valid_domains)} доменів",
+            "count": len(valid_domains),
+            "domains": valid_domains[:20],  # Показуємо перші 20 для прев'ю
+            "total": len(valid_domains)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Помилка завантаження доменів: {e}")
+        raise HTTPException(status_code=400, detail=f"Помилка обробки: {str(e)}")
+
+
+@router.get("/domains")
+async def get_domains(db: Session = Depends(get_db)):
+    """
+    Отримати список завантажених доменів
+    """
+    try:
+        domains_raw = redis_client.get("config:domains")
+        if domains_raw:
+            domains = json.loads(domains_raw.decode())
+            return {
+                "success": True,
+                "count": len(domains),
+                "domains": domains
+            }
+        return {
+            "success": True,
+            "count": 0,
+            "domains": []
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "count": 0,
+            "domains": [],
+            "error": str(e)
+        }
+
+
+@router.delete("/domains")
+async def clear_domains(db: Session = Depends(get_db)):
+    """
+    Очистити список завантажених доменів
+    """
+    redis_client.delete("config:domains")
+    redis_client.delete("config:domains_count")
+    return {
+        "success": True,
+        "message": "Список доменів очищено"
+    }

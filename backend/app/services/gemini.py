@@ -2,6 +2,7 @@ import google.generativeai as genai
 import json
 import logging
 import asyncio
+import time
 from typing import List, Dict, Optional, Tuple
 from app.schemas.deals import DealSchema
 from app.core.config import settings
@@ -9,6 +10,32 @@ from app.prompts import EMAIL_DEALS_PROMPT
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
+
+# Глобальний rate limiter для Gemini API
+class GeminiRateLimiter:
+    """
+    Простий rate limiter для запобігання 429 помилок.
+    Обмежує кількість запитів до Gemini API.
+    """
+    def __init__(self, requests_per_minute: int = 10):
+        self.requests_per_minute = requests_per_minute
+        self.min_interval = 60.0 / requests_per_minute  # мінімальний інтервал між запитами
+        self.last_request_time = 0.0
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self):
+        """Очікує, якщо потрібно, щоб не перевищити ліміт запитів."""
+        async with self._lock:
+            now = time.time()
+            elapsed = now - self.last_request_time
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                logger.info(f"[RateLimiter] Чекаємо {wait_time:.1f}с перед запитом до Gemini...")
+                await asyncio.sleep(wait_time)
+            self.last_request_time = time.time()
+
+# Глобальний інстанс rate limiter (10 запитів/хвилину для безкоштовного тарифу)
+_rate_limiter = GeminiRateLimiter(requests_per_minute=10)
 
 
 class GeminiService:
@@ -36,7 +63,7 @@ class GeminiService:
 
 СТРУКТУРА відповіді (ОБОВ'ЯЗКОВО JSON):
 [
-  {
+  {{
     "shop": "Назва магазину з сайту",
     "domain": "{domain}",
     "description": "Короткий опис акції (макс 60 символів)",
@@ -49,7 +76,7 @@ class GeminiService:
     "click_url": "Не знайдено",
     "discount": "20% або Не знайдено",
     "categories": ["3", "11"]
-  }
+  }}
 ]
 
 HTML контент сайту {domain}:
@@ -62,7 +89,7 @@ HTML контент сайту {domain}:
         self,
         api_key: Optional[str] = None,
         prompt_template: Optional[str] = None,
-        model_name: str = "gemini-1.5-flash"
+        model_name: Optional[str] = None
     ):
         """
         Ініціалізація GeminiService
@@ -70,11 +97,11 @@ HTML контент сайту {domain}:
         Args:
             api_key: Gemini API ключ (якщо None - береться з settings)
             prompt_template: Кастомний промпт (якщо None - використовується DEFAULT_PROMPT)
-            model_name: Назва моделі Gemini
+            model_name: Назва моделі Gemini (якщо None - береться з settings.GEMINI_MODEL)
         """
         self.api_key = api_key or settings.GEMINI_API_KEY
         self.prompt_template = prompt_template or self.DEFAULT_PROMPT
-        self.model_name = model_name
+        self.model_name = model_name or getattr(settings, "GEMINI_MODEL", "gemini-2.0-flash")
         self.max_retries = 3
         
         # Конфігуруємо Gemini
@@ -124,9 +151,13 @@ HTML контент сайту {domain}:
                 f"[Gemini] HTML обрізано для {domain!r}: orig={orig_len} max={max_len} (GEMINI_MAX_CONTENT_LENGTH)"
             )
         
+        # Екрануємо { і } в HTML, щоб .format() не інтерпретував їх як плейсхолдери
+        # (JS-код на сайтах часто містить {shop: ...}, {data: ...} тощо)
+        safe_html = html_content.replace("{", "{{").replace("}", "}}")
+        
         return self.prompt_template.format(
             domain=domain,
-            html_content=html_content
+            html_content=safe_html
         )
 
     def _prepare_email_prompt(self, email_body: str, domain: str) -> str:
@@ -142,6 +173,7 @@ HTML контент сайту {domain}:
             logger.warning(
                 f"[Gemini] Тіло листа обрізано для {domain!r}: orig={orig_len} max={max_len} (GEMINI_MAX_CONTENT_LENGTH)"
             )
+        # Використовуємо .replace() для обох плейсхолдерів, бо промпт містить JSON-приклад з {..}
         return EMAIL_DEALS_PROMPT.replace("[EMAIL]", body).replace("{domain}", domain)
     
     def _get_response_text(self, response) -> str:
@@ -319,6 +351,9 @@ HTML контент сайту {domain}:
         for attempt in range(1, self.max_retries + 1):
             metadata["attempts"] = attempt
             try:
+                # Rate limiting - чекаємо якщо потрібно
+                await _rate_limiter.acquire()
+                
                 logger.info(f"Спроба {attempt}/{self.max_retries}: Відправка запиту до Gemini для {domain}")
                 loop = asyncio.get_event_loop()
                 response = await loop.run_in_executor(None, self.model.generate_content, prompt)
@@ -361,6 +396,22 @@ HTML контент сайту {domain}:
                 logger.info(f"Чекаємо {2 ** attempt}с перед наступною спробою...")
             except Exception as e:
                 s = str(e).strip()
+                
+                # Спеціальна обробка 429 помилок (Rate Limit)
+                is_rate_limit = "429" in s or "ResourceExhausted" in s or "Resource exhausted" in s
+                
+                if is_rate_limit:
+                    # Для 429 помилок чекаємо довше (30-60 секунд)
+                    wait_time = 30 * attempt  # 30с, 60с, 90с
+                    error_msg = f"Gemini API: Rate limit (429). Чекаємо {wait_time}с..."
+                    logger.warning(error_msg)
+                    metadata["parse_error"] = error_msg
+                    if attempt >= self.max_retries:
+                        return [], f"Gemini API: Rate limit exceeded після {self.max_retries} спроб", metadata
+                    await asyncio.sleep(wait_time)
+                    logger.info(f"Продовжуємо після очікування {wait_time}с...")
+                    continue
+                
                 error_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)" if ('"shop"' in s or (s and "shop" in s and len(s) < 30)) else f"Gemini API: {type(e).__name__}: {s[:180]}"
                 logger.error(error_msg, exc_info=True)
                 metadata["parse_error"] = error_msg

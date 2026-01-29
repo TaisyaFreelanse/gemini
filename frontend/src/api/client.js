@@ -54,6 +54,10 @@ export const configAPI = {
   update: (data) => apiClient.put('/config', data),
   reset: () => apiClient.post('/config/reset'),
   test: (data) => apiClient.post('/config/test', data),
+  // Domains management
+  uploadDomains: (data) => apiClient.post('/config/domains/upload', data),
+  getDomains: () => apiClient.get('/config/domains'),
+  clearDomains: () => apiClient.delete('/config/domains'),
 };
 
 // ========== Reports API ==========
@@ -81,6 +85,14 @@ export const schedulerAPI = {
   getJob: (jobId) => apiClient.get(`/scheduler/jobs/${jobId}`),
   initDefaults: (domains, config) => 
     apiClient.post('/scheduler/init-defaults', { domains, config }),
+};
+
+// ========== Logs API ==========
+
+export const logsAPI = {
+  get: (params) => apiClient.get('/logs', { params }),
+  clear: () => apiClient.delete('/logs'),
+  stats: () => apiClient.get('/logs/stats'),
 };
 
 // ========== Health Check ==========

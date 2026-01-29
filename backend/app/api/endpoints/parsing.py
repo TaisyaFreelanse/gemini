@@ -45,72 +45,58 @@ async def start_parsing(
             detail="Парсинг вже запущено. Зупиніть поточний процес перед запуском нового."
         )
     
-    # Отримати список доменів з API
+    # Отримати список доменів
     domains = []
     try:
-        # Отримуємо URL API з конфігурації
-        api_url_redis = redis_client.get("config:api_url")
-        if api_url_redis:
-            api_url = api_url_redis.decode()
-        else:
-            from app.core.config import settings
-            api_url = settings.DOMAINS_API_URL or "http://localhost:8000/api/v1/mock-domains"
+        import json as json_module
         
-        # Якщо це mock-domains, читаємо файл напряму (швидше і надійніше)
-        if "mock-domains" in api_url or api_url.endswith("/mock-domains"):
-            from pathlib import Path
-            import json
-            api_json_path = Path("/app/api.json")
-            if api_json_path.exists():
-                logger.info(f"Читаємо домени з файлу: {api_json_path}")
-                with open(api_json_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                if isinstance(data, dict) and 'data' in data:
-                    raw_domains = data['data']
-                elif isinstance(data, list):
-                    raw_domains = data
-                else:
-                    raw_domains = []
-                
-                # Обробляємо домени
-                for item in raw_domains:
-                    if isinstance(item, str):
-                        domains.append(item)
-                    elif isinstance(item, dict):
-                        url = item.get('url', '') or item.get('domain', '') or item.get('name', '')
-                        if url:
-                            if '://' in url:
-                                from urllib.parse import urlparse
-                                parsed = urlparse(url)
-                                domain = parsed.netloc or parsed.path
-                            else:
-                                domain = url
-                            if domain:
-                                domains.append(domain)
-            else:
-                logger.warning(f"Файл api.json не знайдено: {api_json_path}")
-        else:
-            # Завантажуємо домени через HTTP
+        # 1. Спочатку перевіряємо завантажені домени з Redis (через Configuration)
+        uploaded_domains_raw = redis_client.get("config:domains")
+        if uploaded_domains_raw:
             try:
-                with httpx.Client(timeout=10.0) as client:
-                    response = client.get(api_url)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if isinstance(data, dict) and 'data' in data:
-                            raw_domains = data['data']
-                        elif isinstance(data, list):
-                            raw_domains = data
-                        else:
-                            raw_domains = []
-                        
-                        # Обробляємо домени (можуть бути строки або об'єкти)
-                        for item in raw_domains:
-                            if isinstance(item, str):
-                                domains.append(item)
-                            elif isinstance(item, dict):
-                                url = item.get('url', '') or item.get('domain', '')
-                                if url and '://' in url:
+                uploaded_domains = json_module.loads(uploaded_domains_raw.decode())
+                if uploaded_domains and isinstance(uploaded_domains, list):
+                    domains = uploaded_domains
+                    logger.info(f"Використовуємо {len(domains)} завантажених доменів з конфігурації")
+            except Exception as e:
+                logger.warning(f"Помилка читання завантажених доменів: {e}")
+        
+        # 2. Якщо немає завантажених доменів, пробуємо API
+        # 2. Якщо немає завантажених доменів, пробуємо API або файл
+        if not domains:
+            # Отримуємо URL API з конфігурації
+            api_url_redis = redis_client.get("config:api_url")
+            if api_url_redis:
+                api_url = api_url_redis.decode()
+            else:
+                from app.core.config import settings
+                api_url = settings.DOMAINS_API_URL or "http://localhost:8000/api/v1/mock-domains"
+            
+            # Якщо це mock-domains, читаємо файл напряму (швидше і надійніше)
+            if "mock-domains" in api_url or api_url.endswith("/mock-domains"):
+                from pathlib import Path
+                import json
+                api_json_path = Path("/app/api.json")
+                if api_json_path.exists():
+                    logger.info(f"Читаємо домени з файлу: {api_json_path}")
+                    with open(api_json_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    if isinstance(data, dict) and 'data' in data:
+                        raw_domains = data['data']
+                    elif isinstance(data, list):
+                        raw_domains = data
+                    else:
+                        raw_domains = []
+                    
+                    # Обробляємо домени
+                    for item in raw_domains:
+                        if isinstance(item, str):
+                            domains.append(item)
+                        elif isinstance(item, dict):
+                            url = item.get('url', '') or item.get('domain', '') or item.get('name', '')
+                            if url:
+                                if '://' in url:
                                     from urllib.parse import urlparse
                                     parsed = urlparse(url)
                                     domain = parsed.netloc or parsed.path
@@ -118,15 +104,45 @@ async def start_parsing(
                                     domain = url
                                 if domain:
                                     domains.append(domain)
-                    else:
-                        raise HTTPException(
-                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail=f"API повернув статус {response.status_code}"
-                        )
-            except httpx.HTTPError as e:
-                logger.error(f"Помилка HTTP при отриманні доменів: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                else:
+                    logger.warning(f"Файл api.json не знайдено: {api_json_path}")
+            else:
+                # Завантажуємо домени через HTTP
+                try:
+                    with httpx.Client(timeout=10.0) as client:
+                        response = client.get(api_url)
+                        if response.status_code == 200:
+                            data = response.json()
+                            if isinstance(data, dict) and 'data' in data:
+                                raw_domains = data['data']
+                            elif isinstance(data, list):
+                                raw_domains = data
+                            else:
+                                raw_domains = []
+                            
+                            # Обробляємо домени (можуть бути строки або об'єкти)
+                            for item in raw_domains:
+                                if isinstance(item, str):
+                                    domains.append(item)
+                                elif isinstance(item, dict):
+                                    url = item.get('url', '') or item.get('domain', '')
+                                    if url and '://' in url:
+                                        from urllib.parse import urlparse
+                                        parsed = urlparse(url)
+                                        domain = parsed.netloc or parsed.path
+                                    else:
+                                        domain = url
+                                    if domain:
+                                        domains.append(domain)
+                        else:
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"API повернув статус {response.status_code}"
+                            )
+                except httpx.HTTPError as e:
+                    logger.error(f"Помилка HTTP при отриманні доменів: {e}")
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Не вдалося отримати список доменів: {str(e)}"
                 )
         
@@ -156,12 +172,14 @@ async def start_parsing(
         gemini_key_redis = redis_client.get("config:gemini_key")
         gemini_key = gemini_key_redis.decode() if gemini_key_redis else settings.GEMINI_API_KEY
 
-        # Проксі: спочатку config:proxy (JSON), потім config:proxy_*, потім settings
+        # Проксі: спочатку config:proxy (JSON), потім config:proxy_*, потім settings (.env)
         proxy_host = None
         proxy_login = None
         proxy_password = None
         proxy_http_port = settings.PROXY_HTTP_PORT
         proxy_socks_port = settings.PROXY_SOCKS_PORT
+        
+        # 1. Спочатку перевіряємо JSON конфіг з Redis
         config_proxy_raw = redis_client.get("config:proxy")
         if config_proxy_raw:
             try:
@@ -170,31 +188,43 @@ async def start_parsing(
                 proxy_host = p.get("host") or None
                 proxy_login = p.get("login") or None
                 proxy_password = p.get("password") or None
-                proxy_http_port = p.get("http_port", settings.PROXY_HTTP_PORT)
-                proxy_socks_port = p.get("socks_port", settings.PROXY_SOCKS_PORT)
+                proxy_http_port = p.get("http_port") or settings.PROXY_HTTP_PORT
+                proxy_socks_port = p.get("socks_port") or settings.PROXY_SOCKS_PORT
             except Exception:
                 pass
-        if proxy_host is None:
+        
+        # 2. Потім перевіряємо окремі ключі в Redis
+        if not proxy_host:
             ph = redis_client.get("config:proxy_host")
-            proxy_host = ph.decode() if ph else settings.PROXY_HOST
-        if proxy_login is None:
+            proxy_host = (ph.decode().strip() if ph else None) or None
+        if not proxy_login:
             pl = redis_client.get("config:proxy_login")
-            proxy_login = pl.decode() if pl else settings.PROXY_LOGIN
-        if proxy_password is None:
+            proxy_login = (pl.decode().strip() if pl else None) or None
+        if not proxy_password:
             pp = redis_client.get("config:proxy_password")
-            proxy_password = pp.decode() if pp else settings.PROXY_PASSWORD
+            proxy_password = (pp.decode().strip() if pp else None) or None
         try:
             pport = redis_client.get("config:proxy_http_port")
-            if pport:
-                proxy_http_port = int(pport.decode())
+            if pport and pport.decode().strip():
+                proxy_http_port = int(pport.decode().strip())
         except Exception:
             pass
         try:
             psport = redis_client.get("config:proxy_socks_port")
-            if psport:
-                proxy_socks_port = int(psport.decode())
+            if psport and psport.decode().strip():
+                proxy_socks_port = int(psport.decode().strip())
         except Exception:
             pass
+        
+        # 3. Фінальний fallback на settings (.env)
+        if not proxy_host:
+            proxy_host = settings.PROXY_HOST
+        if not proxy_login:
+            proxy_login = settings.PROXY_LOGIN
+        if not proxy_password:
+            proxy_password = settings.PROXY_PASSWORD
+        
+        logger.info(f"Proxy config: host={proxy_host}, port={proxy_http_port}, login={proxy_login[:3] if proxy_login else None}***")
 
         prompt_redis = redis_client.get("config:prompt")
         prompt_template = prompt_redis.decode() if prompt_redis else None
@@ -321,8 +351,12 @@ async def get_parsing_status(db: Session = Depends(get_db)):
 
             progress_percent = (processed / total * 100) if total > 0 else 0.0
 
-            if session.started_at:
-                duration = (datetime.utcnow() - session.started_at).total_seconds() / 3600
+            # Конвертуємо timezone-aware в naive для порівняння
+            started_at_naive = session.started_at.replace(tzinfo=None) if session.started_at and session.started_at.tzinfo else session.started_at
+            completed_at_naive = session.completed_at.replace(tzinfo=None) if session.completed_at and session.completed_at.tzinfo else session.completed_at
+            
+            if started_at_naive:
+                duration = (datetime.utcnow() - started_at_naive).total_seconds() / 3600
                 domains_per_hour = processed / duration if duration > 0 else 0.0
             else:
                 domains_per_hour = 0.0
@@ -333,7 +367,7 @@ async def get_parsing_status(db: Session = Depends(get_db)):
                     hours=remaining / domains_per_hour
                 )
             else:
-                estimated_completion = session.completed_at or datetime.utcnow()
+                estimated_completion = completed_at_naive or datetime.utcnow()
 
             return ParsingStatusResponse(
                 session_id=session_id,

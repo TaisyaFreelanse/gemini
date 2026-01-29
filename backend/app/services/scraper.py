@@ -25,7 +25,19 @@ class WebScraper:
     - Retry logic: максимум 3 спроби
     """
     
+    # Список реалістичних User-Agent для ротації
+    USER_AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    ]
+    
     def __init__(self, proxy_rotator: Optional[ProxyRotator] = None):
+        import random
         self.proxy_rotator = proxy_rotator
         # connect=15 — час на підключення до проксі; total — на весь запит
         self.timeout = aiohttp.ClientTimeout(
@@ -34,13 +46,30 @@ class WebScraper:
             sock_connect=15,
         )
         self.max_retries = settings.SCRAPING_MAX_RETRIES
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+        self._random = random
+    
+    def _get_headers(self, url: str) -> dict:
+        """Отримати headers з випадковим User-Agent"""
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path.split('/')[0]
+        
+        return {
+            'User-Agent': self._random.choice(self.USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Referer': f'https://www.google.com/search?q={domain}',
         }
     
     async def fetch_website(self, url: str, use_proxy: bool = True) -> Tuple[Optional[str], Optional[str]]:
@@ -75,8 +104,9 @@ class WebScraper:
                     proxy_auth = aiohttp.BasicAuth(login, password) if (login and password) else None
 
                 # Виконуємо HTTP запит
+                headers = self._get_headers(url)
                 async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                    kwargs = {'headers': self.headers}
+                    kwargs = {'headers': headers}
                     if proxy_base_url:
                         kwargs['proxy'] = proxy_base_url
                         if proxy_auth:
@@ -102,13 +132,23 @@ class WebScraper:
                             error_msg = f"HTTP {response.status}: {response.reason}"
                             logger.warning(f"✗ {error_msg} для {url}")
                             
-                            # Якщо помилка клієнта (4xx) - не повторюємо
-                            if 400 <= response.status < 500:
+                            # 403 - антибот захист, ПРОПУСКАЄМО ОДРАЗУ (не повторюємо)
+                            if response.status == 403:
+                                logger.info(f"⏭ Пропускаємо {url} - антибот захист (403)")
                                 return None, error_msg
                             
-                            # Для інших помилок - позначаємо проксі як невдалий
-                            if proxy_base_url and self.proxy_rotator:
-                                self.proxy_rotator.mark_proxy_failed(proxy_base_url)
+                            # 429 - rate limit, повторюємо
+                            if response.status == 429:
+                                if proxy_base_url and self.proxy_rotator:
+                                    self.proxy_rotator.mark_proxy_failed(proxy_base_url)
+                                # Продовжуємо retry loop
+                            # Інші 4xx помилки - не повторюємо
+                            elif 400 <= response.status < 500:
+                                return None, error_msg
+                            else:
+                                # 5xx помилки - позначаємо проксі як невдалий
+                                if proxy_base_url and self.proxy_rotator:
+                                    self.proxy_rotator.mark_proxy_failed(proxy_base_url)
 
             except asyncio.TimeoutError:
                 error_msg = f"Timeout після {settings.SCRAPING_TIMEOUT} секунд"

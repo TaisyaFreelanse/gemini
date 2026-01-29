@@ -177,6 +177,7 @@ async def get_detailed_report(
 async def export_report(
     format: Literal["csv", "json"] = Query("csv", description="Формат експорту"),
     session_id: Optional[int] = Query(None, description="ID сесії для експорту"),
+    domain: Optional[str] = Query(None, description="Фільтр за доменом"),
     db: Session = Depends(get_db)
 ):
     """
@@ -184,41 +185,83 @@ async def export_report(
     
     - **format**: csv або json
     - **session_id**: Експортувати конкретну сесію (None = всі)
+    - **domain**: Фільтр за доменом (None = всі)
     """
-    # TODO: Отримати дані з БД
+    from app.db import crud
+    from datetime import datetime
     
-    # Mock дані для демонстрації
-    deals = [
-        {
-            "id": 1,
-            "domain": "example.com",
-            "shop": "Example Shop",
-            "description": "Знижка 20%",
-            "code": "SAVE20",
-            "discount": "20%",
-            "created_at": "2026-01-24 12:00:00"
+    # Отримуємо реальні дані з БД
+    scraped_deals = crud.get_scraped_deals(
+        db, 
+        session_id=session_id, 
+        domain=domain,
+        limit=10000  # Максимум для експорту
+    )
+    
+    # Перетворюємо в плоский формат для експорту
+    deals = []
+    for deal in scraped_deals:
+        deal_data = deal.deal_data or {}
+        flat_deal = {
+            "id": deal.id,
+            "session_id": deal.session_id,
+            "domain": deal.domain,
+            "shop": deal_data.get("shop", ""),
+            "description": deal_data.get("description", ""),
+            "full_description": deal_data.get("full_description", ""),
+            "code": deal_data.get("code", ""),
+            "discount": deal_data.get("discount", ""),
+            "offer_type": deal_data.get("offer_type", ""),
+            "target_url": deal_data.get("target_url", ""),
+            "date_start": deal_data.get("date_start", ""),
+            "date_end": deal_data.get("date_end", ""),
+            "categories": ", ".join(deal_data.get("categories", [])) if deal_data.get("categories") else "",
+            "webhook_sent": deal.webhook_sent,
+            "created_at": deal.created_at.strftime("%Y-%m-%d %H:%M:%S") if deal.created_at else ""
         }
-    ]
+        deals.append(flat_deal)
+    
+    if not deals:
+        deals = [{"message": "Немає даних для експорту"}]
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     if format == "csv":
         # Створюємо CSV
         output = io.StringIO()
-        if deals:
+        if deals and "message" not in deals[0]:
             writer = csv.DictWriter(output, fieldnames=deals[0].keys())
             writer.writeheader()
             writer.writerows(deals)
+        else:
+            output.write("Немає даних для експорту")
         
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",
             headers={
-                "Content-Disposition": f"attachment; filename=scraping_report.csv"
+                "Content-Disposition": f"attachment; filename=scraping_report_{timestamp}.csv"
             }
         )
     
     else:  # JSON
-        return {
+        export_data = {
             "format": "json",
-            "records_count": len(deals),
-            "data": deals
+            "exported_at": datetime.now().isoformat(),
+            "records_count": len(deals) if "message" not in deals[0] else 0,
+            "filters": {
+                "session_id": session_id,
+                "domain": domain
+            },
+            "data": deals if "message" not in deals[0] else []
         }
+        
+        json_content = json.dumps(export_data, ensure_ascii=False, indent=2)
+        
+        return StreamingResponse(
+            iter([json_content]),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f"attachment; filename=scraping_report_{timestamp}.json"
+            }
+        )

@@ -9,8 +9,79 @@ from apscheduler.jobstores.memory import MemoryJobStore
 import asyncio
 
 from app.core.config import settings
+import redis
+import json
 
 logger = logging.getLogger(__name__)
+
+# Redis клієнт для читання конфігурації
+_redis_client = None
+
+def _get_redis():
+    """Отримати Redis клієнт (lazy init)"""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(settings.REDIS_URL)
+    return _redis_client
+
+
+def _redis_str(key: str, default: str = "") -> str:
+    """Прочитати строку з Redis"""
+    try:
+        raw = _get_redis().get(key)
+        return raw.decode().strip() if raw else default
+    except Exception:
+        return default
+
+
+def _redis_int(key: str, default: int) -> int:
+    """Прочитати int з Redis"""
+    try:
+        raw = _get_redis().get(key)
+        return int(raw.decode()) if raw else default
+    except Exception:
+        return default
+
+
+def _get_current_config() -> Dict:
+    """
+    Отримати актуальну конфігурацію з Redis та .env
+    Викликається в момент запуску задачі, щоб використати поточні налаштування
+    """
+    # Gemini
+    gemini_key = _redis_str("config:gemini_key") or settings.GEMINI_API_KEY
+    prompt_template = _redis_str("config:prompt") or None
+    
+    # Proxy - читаємо з Redis, fallback на .env
+    proxy_host = _redis_str("config:proxy_host") or settings.PROXY_HOST
+    proxy_login = _redis_str("config:proxy_login") or settings.PROXY_LOGIN
+    proxy_password = _redis_str("config:proxy_password") or settings.PROXY_PASSWORD
+    proxy_http_port = _redis_int("config:proxy_http_port", settings.PROXY_HTTP_PORT)
+    proxy_socks_port = _redis_int("config:proxy_socks_port", settings.PROXY_SOCKS_PORT)
+    
+    # Webhook
+    webhook_url = _redis_str("config:webhook_url") or settings.WEBHOOK_URL
+    webhook_token = _redis_str("config:webhook_token") or settings.WEBHOOK_TOKEN
+    
+    config = {
+        'gemini_key': gemini_key,
+        'prompt': prompt_template,
+        'webhook': {
+            'url': webhook_url,
+            'token': webhook_token
+        },
+        'proxy': {
+            'host': proxy_host,
+            'http_port': proxy_http_port,
+            'socks_port': proxy_socks_port,
+            'login': proxy_login,
+            'password': proxy_password
+        } if proxy_host else None
+    }
+    
+    logger.info(f"Config loaded: proxy={'enabled' if proxy_host else 'disabled'}, host={proxy_host}")
+    
+    return config
 
 
 class SchedulerService:
@@ -271,23 +342,35 @@ class SchedulerService:
         Args:
             cron_expression: Cron вираз (напр. "0 0 * * *")
             domains: Список доменів для парсингу
-            config: Додаткова конфігурація
+            config: Додаткова конфігурація (ігнорується, читається з Redis/.env)
         
         Returns:
             Job instance або None
         """
         from app.tasks.scraping_tasks import start_batch_scraping
-        import time
+        from app.db.session import SessionLocal
+        from app.db import crud
         
         job_id = "full_scraping"
         
         def run_full_scraping():
             """Wrapper для синхронного виклику Celery task"""
-            session_id = int(time.time())
-            logger.info(f"Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
+            # Читаємо актуальний конфіг в момент запуску (не при створенні job)
+            runtime_config = _get_current_config()
             
-            result = start_batch_scraping.delay(domains, session_id, config)
-            logger.info(f"Celery task запущено: {result.id}")
+            # Створюємо сесію в БД
+            db = SessionLocal()
+            try:
+                db_session = crud.create_scraping_session(db, total_domains=len(domains))
+                session_id = db_session.id
+                logger.info(f"Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
+                
+                result = start_batch_scraping.delay(domains, session_id, runtime_config)
+                logger.info(f"Celery task запущено: {result.id}")
+            except Exception as e:
+                logger.error(f"Помилка створення сесії парсингу: {e}")
+            finally:
+                db.close()
         
         return self.add_cron_job(
             job_id=job_id,
@@ -310,33 +393,45 @@ class SchedulerService:
             cron_expression: Cron вираз
             all_domains: Повний список доменів
             batch_size: Кількість доменів в одній пачці
-            config: Додаткова конфігурація
+            config: Додаткова конфігурація (ігнорується, читається з Redis/.env)
         
         Returns:
             Job instance або None
         """
         from app.tasks.scraping_tasks import start_batch_scraping
-        import time
+        from app.db.session import SessionLocal
+        from app.db import crud
         import random
         
         job_id = "partial_scraping"
         
         def run_partial_scraping():
             """Wrapper для часткового парсингу"""
+            # Читаємо актуальний конфіг в момент запуску
+            runtime_config = _get_current_config()
+            
             # Вибираємо випадкові домени для парсингу
             domains_batch = random.sample(
                 all_domains,
                 min(batch_size, len(all_domains))
             )
             
-            session_id = int(time.time())
-            logger.info(
-                f"Запуск часткового парсингу: {len(domains_batch)}/{len(all_domains)} доменів, "
-                f"сесія {session_id}"
-            )
-            
-            result = start_batch_scraping.delay(domains_batch, session_id, config)
-            logger.info(f"Celery task запущено: {result.id}")
+            # Створюємо сесію в БД
+            db = SessionLocal()
+            try:
+                db_session = crud.create_scraping_session(db, total_domains=len(domains_batch))
+                session_id = db_session.id
+                logger.info(
+                    f"Запуск часткового парсингу: {len(domains_batch)}/{len(all_domains)} доменів, "
+                    f"сесія {session_id}"
+                )
+                
+                result = start_batch_scraping.delay(domains_batch, session_id, runtime_config)
+                logger.info(f"Celery task запущено: {result.id}")
+            except Exception as e:
+                logger.error(f"Помилка створення сесії парсингу: {e}")
+            finally:
+                db.close()
         
         return self.add_cron_job(
             job_id=job_id,

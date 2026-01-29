@@ -17,6 +17,15 @@ from app.core.config import settings
 redis_client = redis.from_url(settings.REDIS_URL)
 
 
+def _add_ui_log(level: str, message: str, domain: str = None, extra: dict = None):
+    """Додати лог для UI (в Redis)"""
+    try:
+        from app.api.endpoints.logs import add_log
+        add_log(level, message, domain, extra)
+    except Exception:
+        pass  # Не блокувати основний процес
+
+
 class CallbackTask(Task):
     """Базовий клас для задач з callback"""
     
@@ -41,6 +50,7 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
     """
     task_id = self.request.id
     logger.info(f"[Task {task_id}] Початок парсингу домену: {domain}")
+    _add_ui_log("INFO", f"Початок парсингу домену: {domain}", domain)
     
     # Оновлюємо статус в Redis
     _update_task_status(task_id, domain, "running", session_id)
@@ -55,11 +65,20 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
         # Оновлюємо сесію в БД
         _update_session_in_db(session_id, result)
         
-        logger.info(f"[Task {task_id}] ✓ Завершено парсинг {domain}: {result.get('deals_count', 0)} угод")
+        deals_count = result.get('deals_count', 0)
+        if result.get('success'):
+            logger.info(f"[Task {task_id}] ✓ Завершено парсинг {domain}: {deals_count} угод")
+            _add_ui_log("INFO", f"✓ Завершено парсинг {domain}: {deals_count} угод", domain, {"deals_count": deals_count})
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            logger.warning(f"[Task {task_id}] ⚠ Парсинг {domain} завершено з помилкою: {error_msg}")
+            _add_ui_log("WARNING", f"⚠ Парсинг {domain}: {error_msg[:100]}", domain)
+        
         return result
     
     except Exception as e:
         logger.error(f"[Task {task_id}] ✗ Помилка парсингу {domain}: {str(e)}", exc_info=True)
+        _add_ui_log("ERROR", f"✗ Критична помилка парсингу {domain}: {str(e)[:100]}", domain)
         
         error_result = {
             "success": False,
@@ -100,17 +119,24 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         scraper = WebScraper.create_with_config(proxy_config) if proxy_config else WebScraper()
         
         logger.info(f"Завантаження HTML для {domain}...")
+        _add_ui_log("DEBUG", f"Завантаження HTML для {domain}...", domain)
+        
         # use_cache=False — async Redis кеш дає "Event loop is closed" у Celery
         scraped_data = await scraper.scrape_domain(domain, use_proxy=bool(proxy_config), use_cache=False)
         
         if not scraped_data['success']:
-            result['error'] = scraped_data.get('error', 'Scraping failed')
+            error_msg = scraped_data.get('error', 'Scraping failed')
+            result['error'] = error_msg
+            _add_ui_log("ERROR", f"Помилка завантаження {domain}: {error_msg[:100]}", domain)
             return result
         
-        result['metadata']['html_length'] = len(scraped_data.get('html_raw', ''))
+        html_len = len(scraped_data.get('html_raw', ''))
+        result['metadata']['html_length'] = html_len
+        _add_ui_log("INFO", f"✓ Завантажено HTML для {domain} ({html_len} байт)", domain, {"html_length": html_len})
         
     except Exception as e:
         logger.error(f"Помилка WebScraper для {domain}: {e}")
+        _add_ui_log("ERROR", f"WebScraper помилка для {domain}: {str(e)[:100]}", domain)
         result['error'] = f"WebScraper error: {str(e)}"
         return result
     
@@ -124,11 +150,14 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         )
         
         logger.info(f"Аналіз через Gemini AI для {domain}...")
+        _add_ui_log("DEBUG", f"Аналіз через Gemini AI для {domain}...", domain)
+        
         deals, error, metadata = await gemini.extract_deals_from_scraped_data(scraped_data)
         
         if error:
             result['error'] = error
             result['metadata']['gemini'] = metadata
+            _add_ui_log("WARNING", f"Gemini помилка для {domain}: {error[:100]}", domain)
             return result
         
         result['success'] = True
@@ -137,6 +166,7 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         result['metadata']['gemini'] = metadata
         
         logger.info(f"✓ Знайдено {len(deals)} угод для {domain}")
+        _add_ui_log("INFO", f"✓ Gemini знайшов {len(deals)} угод для {domain}", domain, {"deals_count": len(deals)})
         
     except Exception as e:
         err_s = str(e).strip()
@@ -145,6 +175,7 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         else:
             msg = f"Gemini error: {err_s[:200]}"
         logger.error(f"Помилка Gemini для {domain}: {msg}")
+        _add_ui_log("ERROR", f"Gemini помилка для {domain}: {msg[:100]}", domain)
         result['error'] = msg
         return result
     
@@ -185,16 +216,25 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
             webhook = WebhookService.create_from_config(webhook_config)
             
             logger.info(f"Відправка {result['deals_count']} угод в webhook...")
+            _add_ui_log("DEBUG", f"Відправка {result['deals_count']} угод в webhook для {domain}...", domain)
+            
             webhook_result = await webhook.send_deals_from_scraping_result(result, session_id)
             
             result['webhook_sent'] = webhook_result['successful'] > 0
             result['webhook_stats'] = webhook_result
             
-            logger.info(
-                f"Webhook: {webhook_result['successful']}/{webhook_result['total']} успішних"
-            )
+            successful = webhook_result['successful']
+            total = webhook_result['total']
+            logger.info(f"Webhook: {successful}/{total} успішних")
+            
+            if successful > 0:
+                _add_ui_log("INFO", f"✓ Webhook: відправлено {successful}/{total} угод для {domain}", domain, {"successful": successful, "total": total})
+            else:
+                _add_ui_log("WARNING", f"⚠ Webhook: 0/{total} угод для {domain}", domain)
+                
         except Exception as e:
             logger.error(f"Помилка відправки в webhook: {e}")
+            _add_ui_log("ERROR", f"Webhook помилка для {domain}: {str(e)[:100]}", domain)
             result['webhook_sent'] = False
             result['webhook_error'] = str(e)
     
@@ -352,6 +392,17 @@ def start_batch_scraping(domains: List[str], session_id: int, config: Optional[D
     """
     logger.info(f"Запуск пакетного парсингу: {len(domains)} доменів, сесія {session_id}")
     
+    # Логуємо конфігурацію (без паролів)
+    proxy_info = "Без проксі"
+    if config and config.get('proxy') and config['proxy'].get('host'):
+        proxy_info = f"Проксі: {config['proxy']['host']}:{config['proxy'].get('http_port', 59100)}"
+    
+    _add_ui_log("INFO", f"🚀 Старт парсингу: {len(domains)} доменів, сесія #{session_id}", extra={
+        "session_id": session_id,
+        "total_domains": len(domains),
+        "proxy": proxy_info
+    })
+    
     # Ініціалізуємо прогрес сесії
     _init_session_progress(session_id, domains)
     
@@ -365,6 +416,7 @@ def start_batch_scraping(domains: List[str], session_id: int, config: Optional[D
         })
     
     logger.info(f"Запущено {len(task_ids)} задач для сесії {session_id}")
+    _add_ui_log("INFO", f"📋 Запущено {len(task_ids)} задач для обробки", extra={"task_count": len(task_ids)})
     
     return {
         "session_id": session_id,

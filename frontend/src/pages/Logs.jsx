@@ -1,14 +1,27 @@
 import { useState, useEffect, useRef } from 'react';
+import { logsAPI } from '../api/client';
 
 export default function Logs() {
-  const [logs, setLogs] = useState([
-    { id: 1, level: 'INFO', message: 'Scheduler запущено', timestamp: new Date().toISOString() },
-    { id: 2, level: 'INFO', message: 'Очікування подій парсингу...', timestamp: new Date().toISOString() },
-    { id: 3, level: 'INFO', message: 'Логи оновлюються при запуску парсингу', timestamp: new Date().toISOString() },
-  ]);
+  const [logs, setLogs] = useState([]);
   const [filter, setFilter] = useState('all');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState(null);
+  const [lastTimestamp, setLastTimestamp] = useState(null);
   const logsEndRef = useRef(null);
+
+  useEffect(() => {
+    fetchLogs();
+    fetchStats();
+    
+    // Оновлюємо логи кожні 3 секунди
+    const interval = setInterval(() => {
+      fetchLogs();
+      fetchStats();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (autoScroll) {
@@ -16,32 +29,35 @@ export default function Logs() {
     }
   }, [logs, autoScroll]);
 
-  // Mock: Додавання нових логів (замість WebSocket)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const mockLevels = ['INFO', 'ERROR', 'DEBUG', 'WARNING'];
-      const mockMessages = [
-        'Парсинг домену завершено',
-        'Угода відправлена в webhook',
-        'Redis connection established',
-        'Celery worker ready',
-        'Gemini API quota warning',
-        'Proxy rotated successfully',
-        'Завантажено HTML для домену',
-      ];
-      
-      const newLog = {
-        id: Date.now(),
-        level: mockLevels[Math.floor(Math.random() * mockLevels.length)],
-        message: mockMessages[Math.floor(Math.random() * mockMessages.length)],
-        timestamp: new Date().toISOString(),
-      };
-      
-      setLogs(prev => [...prev.slice(-99), newLog]); // Зберігаємо останні 100 логів
-    }, 5000); // Новий лог кожні 5 секунд
+  const fetchLogs = async () => {
+    try {
+      const response = await logsAPI.get({ limit: 200 });
+      if (response.data.success) {
+        // Логи приходять від нових до старих, перевертаємо для відображення
+        const newLogs = (response.data.logs || []).reverse();
+        setLogs(newLogs);
+        
+        if (newLogs.length > 0) {
+          setLastTimestamp(newLogs[newLogs.length - 1].timestamp);
+        }
+      }
+      setLoading(false);
+    } catch (err) {
+      console.error('Error fetching logs:', err);
+      setLoading(false);
+    }
+  };
 
-    return () => clearInterval(interval);
-  }, []);
+  const fetchStats = async () => {
+    try {
+      const response = await logsAPI.stats();
+      if (response.data.success) {
+        setStats(response.data);
+      }
+    } catch (err) {
+      console.error('Error fetching stats:', err);
+    }
+  };
 
   const filteredLogs = filter === 'all' 
     ? logs 
@@ -67,11 +83,26 @@ export default function Logs() {
     }
   };
 
-  const clearLogs = () => {
-    if (confirm('Очистити всі логи?')) {
+  const clearLogs = async () => {
+    if (!confirm('Очистити всі логи?')) return;
+    
+    try {
+      await logsAPI.clear();
       setLogs([]);
+      fetchStats();
+    } catch (err) {
+      console.error('Error clearing logs:', err);
+      alert('Помилка очищення логів');
     }
   };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -88,6 +119,12 @@ export default function Logs() {
             Auto-scroll
           </label>
           <button
+            onClick={fetchLogs}
+            className="px-4 py-2 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700"
+          >
+            🔄 Оновити
+          </button>
+          <button
             onClick={clearLogs}
             className="px-4 py-2 bg-red-600 text-white font-medium rounded-md hover:bg-red-700"
           >
@@ -96,10 +133,36 @@ export default function Logs() {
         </div>
       </div>
 
+      {/* Статистика */}
+      {stats && (
+        <div className="grid grid-cols-5 gap-4">
+          <div className="bg-white p-4 rounded-lg shadow text-center">
+            <div className="text-2xl font-bold text-gray-900">{stats.total || 0}</div>
+            <div className="text-sm text-gray-500">Всього</div>
+          </div>
+          <div className="bg-blue-50 p-4 rounded-lg shadow text-center">
+            <div className="text-2xl font-bold text-blue-600">{stats.by_level?.INFO || 0}</div>
+            <div className="text-sm text-gray-500">INFO</div>
+          </div>
+          <div className="bg-yellow-50 p-4 rounded-lg shadow text-center">
+            <div className="text-2xl font-bold text-yellow-600">{stats.by_level?.WARNING || 0}</div>
+            <div className="text-sm text-gray-500">WARNING</div>
+          </div>
+          <div className="bg-red-50 p-4 rounded-lg shadow text-center">
+            <div className="text-2xl font-bold text-red-600">{stats.by_level?.ERROR || 0}</div>
+            <div className="text-sm text-gray-500">ERROR</div>
+          </div>
+          <div className="bg-gray-50 p-4 rounded-lg shadow text-center">
+            <div className="text-2xl font-bold text-gray-600">{stats.by_level?.DEBUG || 0}</div>
+            <div className="text-sm text-gray-500">DEBUG</div>
+          </div>
+        </div>
+      )}
+
       {/* Фільтри */}
       <div className="bg-white p-4 rounded-lg shadow flex items-center gap-4">
         <span className="text-sm font-medium text-gray-700">Рівень:</span>
-        {['all', 'INFO', 'ERROR', 'WARNING', 'DEBUG'].map(level => (
+        {['all', 'INFO', 'WARNING', 'ERROR', 'DEBUG'].map(level => (
           <button
             key={level}
             onClick={() => setFilter(level)}
@@ -113,7 +176,7 @@ export default function Logs() {
           </button>
         ))}
         <span className="ml-auto text-sm text-gray-500">
-          Всього: {filteredLogs.length} записів
+          Показано: {filteredLogs.length} записів
         </span>
       </div>
 
@@ -121,10 +184,10 @@ export default function Logs() {
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-medium text-gray-900">Real-time логи</h2>
+            <h2 className="text-lg font-medium text-gray-900">Real-time логи парсингу</h2>
             <div className="flex items-center gap-2">
               <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse"></div>
-              <span className="text-sm text-gray-600">Підключено</span>
+              <span className="text-sm text-gray-600">Оновлюється кожні 3 сек</span>
             </div>
           </div>
         </div>
@@ -132,7 +195,11 @@ export default function Logs() {
         <div className="max-h-[600px] overflow-y-auto">
           {filteredLogs.length === 0 ? (
             <div className="text-center py-12 text-gray-500">
-              <p>Немає логів для відображення</p>
+              <svg className="mx-auto h-12 w-12 text-gray-400 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <p className="font-medium">Немає логів для відображення</p>
+              <p className="text-sm mt-1">Логи з'являться при запуску парсингу</p>
             </div>
           ) : (
             <div className="divide-y divide-gray-200">
@@ -141,17 +208,27 @@ export default function Logs() {
                   <div className="flex items-start gap-3">
                     <span className="text-lg">{getLevelIcon(log.level)}</span>
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className={`px-2 py-0.5 text-xs font-medium rounded ${getLevelColor(log.level)}`}>
                           {log.level}
                         </span>
+                        {log.domain && (
+                          <span className="px-2 py-0.5 text-xs font-medium rounded bg-purple-100 text-purple-700">
+                            {log.domain}
+                          </span>
+                        )}
                         <span className="text-xs text-gray-500">
                           {new Date(log.timestamp).toLocaleString()}
                         </span>
                       </div>
-                      <p className="text-sm text-gray-900 font-mono break-words">
+                      <p className="text-sm text-gray-900 break-words">
                         {log.message}
                       </p>
+                      {log.extra && Object.keys(log.extra).length > 0 && (
+                        <div className="mt-1 text-xs text-gray-500 font-mono">
+                          {JSON.stringify(log.extra)}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -176,8 +253,9 @@ export default function Logs() {
             </h3>
             <div className="mt-2 text-sm text-blue-700">
               <p>
-                Логи оновлюються автоматично в режимі реального часу. 
-                Зберігається останні 100 записів. Для повної історії використовуйте файлові логи на сервері.
+                Логи оновлюються автоматично кожні 3 секунди. 
+                Зберігаються останні 500 записів. Логи показують реальний прогрес парсингу: 
+                завантаження HTML, аналіз через Gemini AI, відправка в webhook.
               </p>
             </div>
           </div>
