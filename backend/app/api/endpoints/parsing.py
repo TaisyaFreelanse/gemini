@@ -274,23 +274,80 @@ async def start_parsing(
 @router.post("/stop")
 async def stop_parsing(db: Session = Depends(get_db)):
     """
-    Зупинити поточний парсинг
+    Зупинити поточний парсинг - скасувати всі Celery задачі та скинути статус
     """
+    import logging
+    from app.db import crud
+    from app.tasks.celery_app import celery_app
+    
+    logger = logging.getLogger(__name__)
+    
     current_status = redis_client.get("scraping:status")
-    if not current_status or current_status.decode() != "running":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Немає активного парсингу для зупинки"
-        )
+    if not current_status or current_status.decode() not in ("running", "pending"):
+        # Все одно скидаємо статус, якщо щось застрягло
+        pass
     
-    # TODO: Зупинити всі Celery задачі
-    # TODO: Оновити статус session в БД
+    # 1. Встановлюємо флаг зупинки (задачі перевірятимуть це)
+    redis_client.set("scraping:stop_requested", "1")
+    redis_client.set("scraping:status", "stopping")
     
+    # 2. Отримуємо session_id та скасовуємо всі задачі
+    session_id_raw = redis_client.get("scraping:session_id")
+    session_id = int(session_id_raw.decode()) if session_id_raw else None
+    
+    revoked_count = 0
+    
+    # 2a. Скасовуємо всі задачі з черги
+    try:
+        # Отримуємо збережені task_ids
+        task_ids_raw = redis_client.get("scraping:task_ids")
+        if task_ids_raw:
+            import json
+            task_ids = json.loads(task_ids_raw.decode())
+            for task_id in task_ids:
+                try:
+                    celery_app.control.revoke(task_id, terminate=True, signal='SIGTERM')
+                    revoked_count += 1
+                except Exception as e:
+                    logger.warning(f"Не вдалося скасувати задачу {task_id}: {e}")
+            logger.info(f"Скасовано {revoked_count} задач")
+    except Exception as e:
+        logger.error(f"Помилка скасування задач: {e}")
+    
+    # 2b. Purge черги (скасувати всі очікуючі задачі)
+    try:
+        celery_app.control.purge()
+        logger.info("Черга Celery очищена")
+    except Exception as e:
+        logger.warning(f"Помилка очищення черги: {e}")
+    
+    # 3. Оновлюємо статус сесії в БД
+    if session_id:
+        try:
+            crud.update_scraping_session(db, session_id, status="stopped")
+            logger.info(f"Сесію {session_id} позначено як зупинену")
+        except Exception as e:
+            logger.error(f"Помилка оновлення сесії: {e}")
+    
+    # 4. Очищаємо Redis
     redis_client.set("scraping:status", "stopped")
+    redis_client.delete("scraping:task_ids")
+    redis_client.delete("scraping:stop_requested")
+    
+    # Через 2 секунди скидаємо статус на idle
+    import threading
+    def reset_to_idle():
+        import time
+        time.sleep(2)
+        redis_client.set("scraping:status", "idle")
+        redis_client.delete("scraping:session_id")
+    
+    threading.Thread(target=reset_to_idle, daemon=True).start()
     
     return {
         "success": True,
-        "message": "Парсинг зупинено"
+        "message": f"Парсинг зупинено. Скасовано {revoked_count} задач.",
+        "revoked_tasks": revoked_count
     }
 
 

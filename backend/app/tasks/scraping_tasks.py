@@ -35,6 +35,15 @@ class CallbackTask(Task):
         # Тут можна додати логіку відправки в webhook про помилку
 
 
+def _is_stop_requested() -> bool:
+    """Перевірити чи була запрошена зупинка"""
+    try:
+        stop_flag = redis_client.get("scraping:stop_requested")
+        return stop_flag and stop_flag.decode() == "1"
+    except Exception:
+        return False
+
+
 @celery_app.task(bind=True, base=CallbackTask, name='scrape_domain_task')
 def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict] = None) -> Dict:
     """
@@ -49,6 +58,20 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
         Dict з результатами парсингу
     """
     task_id = self.request.id
+    
+    # Перевіряємо чи не було запрошено зупинку
+    if _is_stop_requested():
+        logger.info(f"[Task {task_id}] ⏹ Пропускаємо {domain} - зупинка запрошена")
+        return {
+            "success": False,
+            "domain": domain,
+            "session_id": session_id,
+            "deals_count": 0,
+            "deals": [],
+            "error": "Зупинка запрошена",
+            "skipped": True
+        }
+    
     logger.info(f"[Task {task_id}] Початок парсингу домену: {domain}")
     _add_ui_log("INFO", f"Початок парсингу домену: {domain}", domain)
     
@@ -138,6 +161,12 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         logger.error(f"Помилка WebScraper для {domain}: {e}")
         _add_ui_log("ERROR", f"WebScraper помилка для {domain}: {str(e)[:100]}", domain)
         result['error'] = f"WebScraper error: {str(e)}"
+        return result
+    
+    # Перевірка зупинки перед Gemini
+    if _is_stop_requested():
+        result['error'] = "Зупинка запрошена"
+        result['skipped'] = True
         return result
     
     # Крок 2: Аналізуємо через Gemini AI
@@ -392,6 +421,9 @@ def start_batch_scraping(domains: List[str], session_id: int, config: Optional[D
     """
     logger.info(f"Запуск пакетного парсингу: {len(domains)} доменів, сесія {session_id}")
     
+    # Очищаємо флаг зупинки від попередніх сесій
+    redis_client.delete("scraping:stop_requested")
+    
     # Логуємо конфігурацію (без паролів)
     proxy_info = "Без проксі"
     if config and config.get('proxy') and config['proxy'].get('host'):
@@ -408,12 +440,17 @@ def start_batch_scraping(domains: List[str], session_id: int, config: Optional[D
     
     # Запускаємо задачі для кожного домену
     task_ids = []
+    task_id_list = []  # Для збереження в Redis
     for domain in domains:
         task = scrape_domain_task.delay(domain, session_id, config)
         task_ids.append({
             "task_id": task.id,
             "domain": domain
         })
+        task_id_list.append(task.id)
+    
+    # Зберігаємо task_ids в Redis для можливості скасування
+    redis_client.set("scraping:task_ids", json.dumps(task_id_list))
     
     logger.info(f"Запущено {len(task_ids)} задач для сесії {session_id}")
     _add_ui_log("INFO", f"📋 Запущено {len(task_ids)} задач для обробки", extra={"task_count": len(task_ids)})
