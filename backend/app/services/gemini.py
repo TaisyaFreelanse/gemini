@@ -401,8 +401,8 @@ HTML контент сайту {domain}:
                 is_rate_limit = "429" in s or "ResourceExhausted" in s or "Resource exhausted" in s
                 
                 if is_rate_limit:
-                    # Для 429 помилок чекаємо довше (30-60 секунд)
-                    wait_time = 30 * attempt  # 30с, 60с, 90с
+                    # Для 429 помилок чекаємо 5-15 секунд
+                    wait_time = 5 * attempt  # 5с, 10с, 15с
                     error_msg = f"Gemini API: Rate limit (429). Чекаємо {wait_time}с..."
                     logger.warning(error_msg)
                     metadata["parse_error"] = error_msg

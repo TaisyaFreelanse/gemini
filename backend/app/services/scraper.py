@@ -72,6 +72,30 @@ class WebScraper:
             'Referer': f'https://www.google.com/search?q={domain}',
         }
     
+    async def _try_playwright(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Спробувати завантажити сторінку через Playwright (headless browser)
+        Використовується як fallback при 403 помилках
+        """
+        try:
+            from app.services.playwright_scraper import fetch_with_playwright
+            
+            # Отримуємо proxy config якщо є
+            proxy_config = None
+            if self.proxy_rotator and self.proxy_rotator.proxy_configs:
+                proxy = self.proxy_rotator.proxy_configs[0]
+                proxy_config = {
+                    'host': proxy.host,
+                    'http_port': proxy.http_port,
+                    'login': proxy.login,
+                    'password': proxy.password
+                }
+            
+            return await fetch_with_playwright(url, proxy_config=proxy_config, timeout=15000)
+        except Exception as e:
+            logger.error(f"Playwright fallback помилка: {e}")
+            return None, f"Playwright error: {str(e)[:100]}"
+    
     async def fetch_website(self, url: str, use_proxy: bool = True) -> Tuple[Optional[str], Optional[str]]:
         """
         Завантажити HTML контент з вказаного URL
@@ -141,10 +165,15 @@ class WebScraper:
                             error_msg = f"HTTP {response.status}: {response.reason}"
                             logger.warning(f"✗ {error_msg} для {url}")
                             
-                            # 403 - антибот захист, ПРОПУСКАЄМО ОДРАЗУ (не повторюємо)
+                            # 403 - антибот захист, пробуємо Playwright
                             if response.status == 403:
-                                logger.info(f"⏭ Пропускаємо {url} - антибот захист (403)")
-                                return None, error_msg
+                                logger.info(f"🌐 Пробуємо Playwright для {url} (антибот 403)")
+                                playwright_html, playwright_error = await self._try_playwright(url)
+                                if playwright_html:
+                                    return playwright_html, None
+                                else:
+                                    logger.warning(f"Playwright теж не зміг: {playwright_error}")
+                                    return None, f"403 + Playwright failed: {playwright_error}"
                             
                             # 429 - rate limit, повторюємо
                             if response.status == 429:
