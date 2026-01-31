@@ -62,7 +62,9 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
     # Перевіряємо чи не було запрошено зупинку
     if _is_stop_requested():
         logger.info(f"[Task {task_id}] ⏹ Пропускаємо {domain} - зупинка запрошена")
-        return {
+        
+        # Update task status with "skipped" terminal state so counters remain consistent
+        skipped_result = {
             "success": False,
             "domain": domain,
             "session_id": session_id,
@@ -71,6 +73,13 @@ def scrape_domain_task(self, domain: str, session_id: int, config: Optional[Dict
             "error": "Зупинка запрошена",
             "skipped": True
         }
+        _update_task_status(task_id, domain, "skipped", session_id, skipped_result)
+        
+        # Also update database session counters to keep DB in sync with Redis
+        # Without this, processed_domains in DB would be lower than Redis counter
+        _update_session_in_db(session_id, skipped_result)
+        
+        return skipped_result
     
     logger.info(f"[Task {task_id}] Початок парсингу домену: {domain}")
     _add_ui_log("INFO", f"Початок парсингу домену: {domain}", domain)
@@ -295,50 +304,70 @@ def _update_task_status(task_id: str, domain: str, status: str, session_id: int,
 
 
 def _update_session_progress(session_id: int, status: str, domain: str):
-    """Оновити прогрес сесії парсингу"""
+    """
+    Оновити прогрес сесії парсингу (атомні операції через Redis Lua script)
+    
+    Uses a Lua script for atomic get-and-set to prevent race conditions.
+    Also handles "skipped" status as a terminal state (counts as processed).
+    """
     try:
-        key = f"session:{session_id}:progress"
+        counters_key = f"session:{session_id}:counters"
+        domains_key = f"session:{session_id}:domain_status"
         
-        # Отримуємо поточний прогрес
-        progress_data = redis_client.get(key)
-        if progress_data:
-            progress = json.loads(progress_data)
-        else:
-            progress = {
-                "session_id": session_id,
-                "total": 0,
-                "processed": 0,
-                "successful": 0,
-                "failed": 0,
-                "running": 0,
-                "domains": {}
-            }
+        # Lua script for atomic status update and counter adjustment
+        # This prevents TOCTOU race conditions between hget and hset
+        lua_script = """
+        local domains_key = KEYS[1]
+        local counters_key = KEYS[2]
+        local domain = ARGV[1]
+        local new_status = ARGV[2]
+        local updated_at = ARGV[3]
         
-        # Оновлюємо статус домену
-        old_status = progress['domains'].get(domain)
-        progress['domains'][domain] = status
+        -- Atomically get old status and set new status
+        local old_status = redis.call('HGET', domains_key, domain)
+        redis.call('HSET', domains_key, domain, new_status)
+        redis.call('EXPIRE', domains_key, 7200)
         
-        # Оновлюємо лічильники
-        if old_status:
-            if old_status == "running":
-                progress['running'] -= 1
+        -- Adjust running counter if old status was "running"
+        if old_status == "running" then
+            redis.call('HINCRBY', counters_key, 'running', -1)
+        end
         
-        if status == "running":
-            progress['running'] += 1
-        elif status == "completed":
-            progress['processed'] += 1
-            progress['successful'] += 1
-        elif status == "failed":
-            progress['processed'] += 1
-            progress['failed'] += 1
+        -- Adjust counters based on new status
+        if new_status == "running" then
+            redis.call('HINCRBY', counters_key, 'running', 1)
+        elseif new_status == "completed" then
+            redis.call('HINCRBY', counters_key, 'processed', 1)
+            redis.call('HINCRBY', counters_key, 'successful', 1)
+        elseif new_status == "failed" then
+            redis.call('HINCRBY', counters_key, 'processed', 1)
+            redis.call('HINCRBY', counters_key, 'failed', 1)
+        elseif new_status == "skipped" then
+            -- Skipped tasks are terminal states and count as processed
+            redis.call('HINCRBY', counters_key, 'processed', 1)
+            redis.call('HINCRBY', counters_key, 'skipped', 1)
+        end
         
-        progress['updated_at'] = datetime.utcnow().isoformat()
+        -- Update timestamp
+        redis.call('HSET', counters_key, 'updated_at', updated_at)
+        redis.call('EXPIRE', counters_key, 7200)
         
-        # Зберігаємо назад
-        redis_client.setex(key, 7200, json.dumps(progress))  # TTL 2 години
+        return old_status
+        """
+        
+        # Execute the Lua script atomically
+        redis_client.eval(
+            lua_script,
+            2,  # Number of keys
+            domains_key,
+            counters_key,
+            domain,
+            status,
+            datetime.utcnow().isoformat()
+        )
         
     except Exception as e:
-        logger.error(f"Помилка оновлення прогресу сесії: {e}")
+        logger.warning(f"Помилка оновлення прогресу сесії: {e}")
 
 
 def _save_scraping_result(session_id: int, domain: str, result: Dict):
@@ -357,53 +386,39 @@ def _save_scraping_result(session_id: int, domain: str, result: Dict):
 
 
 def _update_session_in_db(session_id: int, result: Dict):
-    """Оновити сесію парсингу в БД"""
+    """
+    Оновити сесію парсингу в БД (атомні операції через SQL UPDATE)
+    """
     try:
         from app.db.session import SessionLocal
         from app.db import crud
         
         db = SessionLocal()
         try:
-            session = crud.get_scraping_session(db, session_id)
+            # Використовуємо атомне оновлення лічильників
+            session = crud.atomic_increment_session_counters(
+                db=db,
+                session_id=session_id,
+                success=result.get('success', False)
+            )
+            
             if session:
-                # Отримуємо поточні значення
-                processed = session.processed_domains or 0
-                successful = session.successful_domains or 0
-                failed = session.failed_domains or 0
-                
-                # Оновлюємо лічильники
-                processed += 1
-                if result.get('success'):
-                    successful += 1
-                else:
-                    failed += 1
-                
-                # Перевіряємо чи всі домени оброблені
-                status = session.status
-                if processed >= session.total_domains:
-                    status = "completed"
-                
-                # Оновлюємо сесію
-                crud.update_scraping_session(
-                    db=db,
-                    session_id=session_id,
-                    processed=processed,
-                    successful=successful,
-                    failed=failed,
-                    status=status
-                )
-                
                 # Оновлюємо статус в Redis
-                if status == "completed":
+                if session.status == "completed":
                     redis_client.set("scraping:status", "completed")
-                elif status == "failed":
+                elif session.status == "failed":
                     redis_client.set("scraping:status", "failed")
                 
-                logger.debug(f"Оновлено сесію {session_id}: processed={processed}, successful={successful}, failed={failed}")
+                logger.debug(
+                    f"Оновлено сесію {session_id}: "
+                    f"processed={session.processed_domains}, "
+                    f"successful={session.successful_domains}, "
+                    f"failed={session.failed_domains}"
+                )
         finally:
             db.close()
     except Exception as e:
-        logger.error(f"Помилка оновлення сесії в БД: {e}")
+        logger.warning(f"Помилка оновлення сесії в БД: {e}")
 
 
 @celery_app.task(name='start_batch_scraping')
@@ -464,25 +479,36 @@ def start_batch_scraping(domains: List[str], session_id: int, config: Optional[D
 
 
 def _init_session_progress(session_id: int, domains: List[str]):
-    """Ініціалізувати прогрес сесії"""
+    """
+    Ініціалізувати прогрес сесії (використовує Redis hashes для атомних операцій)
+    """
     try:
-        key = f"session:{session_id}:progress"
-        progress = {
-            "session_id": session_id,
+        counters_key = f"session:{session_id}:counters"
+        domains_key = f"session:{session_id}:domain_status"
+        
+        # Ініціалізуємо лічильники (including skipped)
+        counters = {
             "total": len(domains),
             "processed": 0,
             "successful": 0,
             "failed": 0,
+            "skipped": 0,
             "running": 0,
-            "domains": {domain: "pending" for domain in domains},
             "started_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
         }
-        redis_client.setex(key, 7200, json.dumps(progress))
+        redis_client.hset(counters_key, mapping=counters)
+        redis_client.expire(counters_key, 7200)
+        
+        # Ініціалізуємо статуси доменів (батчами для великих списків)
+        if domains:
+            domain_statuses = {domain: "pending" for domain in domains}
+            redis_client.hset(domains_key, mapping=domain_statuses)
+            redis_client.expire(domains_key, 7200)
         
         # Зберігаємо статус сесії
-        redis_client.set(f"scraping:status", "running")
-        redis_client.set(f"scraping:session_id", session_id)
+        redis_client.set("scraping:status", "running")
+        redis_client.set("scraping:session_id", session_id)
         
     except Exception as e:
         logger.error(f"Помилка ініціалізації прогресу: {e}")
@@ -500,13 +526,37 @@ def get_session_progress(session_id: int) -> Optional[Dict]:
         Dict з прогресом або None
     """
     try:
-        key = f"session:{session_id}:progress"
-        data = redis_client.get(key)
-        if data:
-            return json.loads(data)
-        return None
+        counters_key = f"session:{session_id}:counters"
+        domains_key = f"session:{session_id}:domain_status"
+        
+        # Отримуємо лічильники
+        counters = redis_client.hgetall(counters_key)
+        if not counters:
+            return None
+        
+        # Декодуємо bytes -> str
+        def decode_val(v):
+            return v.decode('utf-8') if isinstance(v, bytes) else v
+        
+        counters = {decode_val(k): decode_val(v) for k, v in counters.items()}
+        
+        # Отримуємо статуси доменів
+        domains = redis_client.hgetall(domains_key)
+        domains = {decode_val(k): decode_val(v) for k, v in domains.items()}
+        
+        return {
+            "session_id": session_id,
+            "total": int(counters.get("total", 0)),
+            "processed": int(counters.get("processed", 0)),
+            "successful": int(counters.get("successful", 0)),
+            "failed": int(counters.get("failed", 0)),
+            "skipped": int(counters.get("skipped", 0)),  # Include skipped counter
+            "running": int(counters.get("running", 0)),
+            "updated_at": counters.get("updated_at"),
+            "domains": domains
+        }
     except Exception as e:
-        logger.error(f"Помилка отримання прогресу: {e}")
+        logger.warning(f"Помилка отримання прогресу: {e}")
         return None
 
 

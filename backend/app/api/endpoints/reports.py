@@ -165,12 +165,118 @@ async def get_detailed_report(
     - **status**: Фільтр по статусу (success, failed, pending)
     - **search**: Пошук по назві домену
     """
-    # TODO: Отримати дані з БД з фільтрами
-    
-    return DetailedReport(
-        domains=[],
-        total=0
-    )
+    import logging
+    from sqlalchemy import func, case, outerjoin
+    from sqlalchemy.orm import aliased
+    from app.models.scraped_deal import ScrapedDeal
+    from app.models.scraping_session import ScrapingSession
+    from app.models.domain import Domain
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        # Use ScrapingSession as the base and LEFT JOIN to ScrapedDeal
+        # This allows us to properly filter by status including "failed" (no deals)
+        # and "pending" (session not completed)
+        
+        # Subquery to get deals aggregated by session
+        deals_subq = db.query(
+            ScrapedDeal.session_id,
+            ScrapedDeal.domain,
+            func.count(ScrapedDeal.id).label('deals_count'),
+            func.max(ScrapedDeal.created_at).label('scraped_at'),
+            func.max(case((ScrapedDeal.webhook_sent == True, 1), else_=0)).label('webhook_sent'),
+            func.count(case((ScrapedDeal.webhook_sent == False, 1))).label('webhook_pending')
+        ).group_by(ScrapedDeal.session_id, ScrapedDeal.domain).subquery()
+
+        # Main query: ScrapingSession LEFT JOIN deals subquery
+        query = db.query(
+            ScrapingSession.id.label('session_id'),
+            ScrapingSession.status.label('session_status'),
+            ScrapingSession.started_at,
+            ScrapingSession.completed_at,
+            ScrapingSession.total_domains,
+            ScrapingSession.processed_domains,
+            ScrapingSession.successful_domains,
+            ScrapingSession.failed_domains,
+            func.coalesce(deals_subq.c.domain, 'unknown').label('domain'),
+            func.coalesce(deals_subq.c.deals_count, 0).label('deals_count'),
+            deals_subq.c.scraped_at,
+            func.coalesce(deals_subq.c.webhook_sent, 0).label('webhook_sent'),
+            func.coalesce(deals_subq.c.webhook_pending, 0).label('webhook_pending')
+        ).outerjoin(
+            deals_subq,
+            ScrapingSession.id == deals_subq.c.session_id
+        )
+
+        # Search by domain (partial match)
+        # Use OR with is_(None) to preserve LEFT JOIN semantics when searching
+        # Without this, NULL domains from LEFT JOIN would be excluded (converting to INNER JOIN)
+        if search:
+            query = query.filter(
+                (deals_subq.c.domain.ilike(f"%{search}%")) | 
+                (deals_subq.c.domain.is_(None))
+            )
+
+        # Status filter using LEFT JOIN result
+        if status:
+            if status == "success":
+                # Success: session completed and has deals (count > 0)
+                query = query.filter(
+                    ScrapingSession.status == "completed",
+                    deals_subq.c.deals_count > 0
+                )
+            elif status == "failed":
+                # Failed: session completed but no deals (count == 0 or NULL from LEFT JOIN)
+                # Or session status is "failed"
+                query = query.filter(
+                    (ScrapingSession.status == "failed") |
+                    ((ScrapingSession.status == "completed") & 
+                     ((deals_subq.c.deals_count == 0) | (deals_subq.c.deals_count.is_(None))))
+                )
+            elif status == "pending":
+                # Pending: session is still running or not yet started
+                query = query.filter(
+                    ScrapingSession.status == "running"
+                )
+
+        # Count total before pagination
+        total_query = query.with_entities(func.count()).scalar()
+        total = total_query or 0
+
+        # Order and paginate
+        results = query.order_by(
+            ScrapingSession.started_at.desc()
+        ).offset(skip).limit(limit).all()
+
+        domain_reports = []
+        for result in results:
+            deals_count = result.deals_count or 0
+            success = deals_count > 0 and result.session_status == "completed"
+            
+            # Determine domain name - use session info if no deals
+            domain_name = result.domain if result.domain != 'unknown' else f"session_{result.session_id}"
+            
+            domain_reports.append(
+                DomainReport(
+                    domain=domain_name,
+                    session_id=result.session_id,
+                    deals_count=deals_count,
+                    success=success,
+                    scraped_at=result.scraped_at or result.started_at,
+                    webhook_sent=bool(result.webhook_sent),
+                    error_count=0 if success else 1,
+                    last_error=None if success else (
+                        "Session running" if result.session_status == "running" 
+                        else ("Session failed" if result.session_status == "failed" else "No deals found")
+                    )
+                )
+            )
+
+        return DetailedReport(domains=domain_reports, total=total)
+    except Exception as e:
+        logger.warning("Detailed reports error: %s", e)
+        return _empty_detailed_report()
 
 
 @router.get("/export")

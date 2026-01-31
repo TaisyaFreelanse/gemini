@@ -3,13 +3,58 @@ import json
 import logging
 import asyncio
 import time
+import random
+import re
+import hashlib
 from typing import List, Dict, Optional, Tuple
 from app.schemas.deals import DealSchema
 from app.core.config import settings
 from app.prompts import EMAIL_DEALS_PROMPT
 from pydantic import ValidationError
+import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
+
+# Константи для backoff
+BACKOFF_BASE = 2
+BACKOFF_MAX = 60
+BACKOFF_JITTER = 0.2
+
+# Константи для кешування
+CACHE_TTL = 3600  # 1 година
+CACHE_PREFIX = "gemini:deals:"
+
+# Shared async Redis client pool (initialized lazily)
+_async_redis_client: Optional[aioredis.Redis] = None
+_async_redis_lock = asyncio.Lock()
+
+
+async def get_async_redis_client() -> aioredis.Redis:
+    """
+    Get or create a shared async Redis client.
+    Uses connection pooling for efficiency.
+    """
+    global _async_redis_client
+    
+    async with _async_redis_lock:
+        if _async_redis_client is None:
+            _async_redis_client = aioredis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=10
+            )
+        return _async_redis_client
+
+
+async def close_async_redis_client():
+    """Close the shared async Redis client on shutdown."""
+    global _async_redis_client
+    
+    async with _async_redis_lock:
+        if _async_redis_client is not None:
+            await _async_redis_client.close()
+            _async_redis_client = None
 
 # Глобальний rate limiter для Gemini API
 class GeminiRateLimiter:
@@ -229,7 +274,6 @@ HTML контент сайту {domain}:
         Розпарсити JSON відповідь від Gemini.
         Підтримує масив [...], об'єкт {"deals": [...]} / {"data": [...]}, markdown блоки.
         """
-        import re
         if not response_text or not isinstance(response_text, str):
             return []
         raw = response_text.strip()
@@ -302,10 +346,51 @@ HTML контент сайту {domain}:
                 invalid_deals.append({"data": deal_dict, "error": str(e)})
         return valid_deals, invalid_deals
     
+    def _get_content_hash(self, content: str) -> str:
+        """Отримати короткий hash контенту для кешування"""
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    async def _get_cached_result(self, cache_key: str) -> Optional[Tuple[List[DealSchema], Dict]]:
+        """
+        Перевірити кеш на наявність результату.
+        Uses shared async Redis client for non-blocking operations.
+        """
+        try:
+            redis_client = await get_async_redis_client()
+            cached = await redis_client.get(cache_key)
+            if cached:
+                data = json.loads(cached)
+                deals = [DealSchema(**d) for d in data.get("deals", [])]
+                metadata = data.get("metadata", {})
+                metadata["cached"] = True
+                logger.info(f"Cache hit: {cache_key}")
+                return deals, metadata
+        except Exception as e:
+            logger.debug(f"Cache read error: {e}")
+        return None
+    
+    async def _set_cached_result(self, cache_key: str, deals: List[DealSchema], metadata: Dict):
+        """
+        Зберегти результат в кеш.
+        Uses shared async Redis client for non-blocking operations.
+        Uses model_dump() for Pydantic v2 compatibility.
+        """
+        try:
+            redis_client = await get_async_redis_client()
+            data = {
+                "deals": [d.model_dump() for d in deals],
+                "metadata": {k: v for k, v in metadata.items() if k != "raw_response"}
+            }
+            await redis_client.setex(cache_key, CACHE_TTL, json.dumps(data, default=str))
+            logger.debug(f"Cached result: {cache_key}")
+        except Exception as e:
+            logger.debug(f"Cache write error: {e}")
+    
     async def extract_deals(
         self,
         html_content: str,
-        domain: str
+        domain: str,
+        use_cache: bool = True
     ) -> Tuple[List[DealSchema], Optional[str], Dict]:
         """
         Витягнути промокоди та акції з HTML контенту
@@ -313,6 +398,7 @@ HTML контент сайту {domain}:
         Args:
             html_content: Очищений HTML контент
             domain: Домен сайту
+            use_cache: Використовувати кешування результатів
         
         Returns:
             Tuple[deals, error_message, metadata]:
@@ -328,13 +414,29 @@ HTML контент сайту {domain}:
         }
         _friendly_shop_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
 
+        # Перевіряємо кеш
+        cache_key = None
+        if use_cache:
+            content_hash = self._get_content_hash(html_content)
+            cache_key = f"{CACHE_PREFIX}{domain}:{content_hash}"
+            cached = await self._get_cached_result(cache_key)
+            if cached:
+                return cached[0], None, cached[1]
+
         try:
             prompt = self._prepare_prompt(html_content, domain)
         except Exception as e:
             if "shop" in str(e).lower() or '"shop"' in str(e):
                 return [], _friendly_shop_msg, metadata
             raise
-        return await self._extract_deals_core(prompt, domain)
+        
+        deals, error, metadata = await self._extract_deals_core(prompt, domain)
+        
+        # Кешуємо успішний результат
+        if cache_key and deals and not error:
+            await self._set_cached_result(cache_key, deals, metadata)
+        
+        return deals, error, metadata
 
     async def _extract_deals_core(
         self, prompt: str, domain: str
@@ -384,16 +486,18 @@ HTML контент сайту {domain}:
                 metadata["parse_error"] = error_msg
                 if attempt >= self.max_retries:
                     return [], error_msg, metadata
-                await asyncio.sleep(2 ** attempt)
-                logger.info(f"Чекаємо {2 ** attempt}с перед повтором...")
+                wait_time = min(BACKOFF_BASE ** attempt, BACKOFF_MAX) + random.uniform(0, 1)
+                await asyncio.sleep(wait_time)
+                logger.info(f"Чекаємо {wait_time:.1f}с перед повтором...")
             except json.JSONDecodeError as e:
                 error_msg = f"Помилка парсингу JSON: {str(e)}"
                 logger.error(error_msg)
                 metadata["parse_error"] = error_msg
                 if attempt >= self.max_retries:
                     return [], error_msg, metadata
-                await asyncio.sleep(2 ** attempt)
-                logger.info(f"Чекаємо {2 ** attempt}с перед наступною спробою...")
+                wait_time = min(BACKOFF_BASE ** attempt, BACKOFF_MAX) + random.uniform(0, 1)
+                await asyncio.sleep(wait_time)
+                logger.info(f"Чекаємо {wait_time:.1f}с перед наступною спробою...")
             except Exception as e:
                 s = str(e).strip()
                 
@@ -401,15 +505,17 @@ HTML контент сайту {domain}:
                 is_rate_limit = "429" in s or "ResourceExhausted" in s or "Resource exhausted" in s
                 
                 if is_rate_limit:
-                    # Для 429 помилок чекаємо 5-15 секунд
-                    wait_time = 5 * attempt  # 5с, 10с, 15с
-                    error_msg = f"Gemini API: Rate limit (429). Чекаємо {wait_time}с..."
+                    # Exponential backoff з jitter для 429 помилок
+                    base_wait = min(BACKOFF_BASE ** (attempt + 2), BACKOFF_MAX)  # 4, 8, 16, 32...
+                    jitter = random.uniform(0, base_wait * BACKOFF_JITTER)
+                    wait_time = base_wait + jitter
+                    error_msg = f"Gemini API: Rate limit (429). Чекаємо {wait_time:.1f}с..."
                     logger.warning(error_msg)
                     metadata["parse_error"] = error_msg
                     if attempt >= self.max_retries:
                         return [], f"Gemini API: Rate limit exceeded після {self.max_retries} спроб", metadata
                     await asyncio.sleep(wait_time)
-                    logger.info(f"Продовжуємо після очікування {wait_time}с...")
+                    logger.info(f"Продовжуємо після очікування {wait_time:.1f}с...")
                     continue
                 
                 error_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)" if ('"shop"' in s or (s and "shop" in s and len(s) < 30)) else f"Gemini API: {type(e).__name__}: {s[:180]}"
@@ -417,8 +523,9 @@ HTML контент сайту {domain}:
                 metadata["parse_error"] = error_msg
                 if attempt >= self.max_retries:
                     return [], error_msg, metadata
-                await asyncio.sleep(2 ** attempt)
-                logger.info(f"Чекаємо {2 ** attempt}с перед повтором...")
+                wait_time = min(BACKOFF_BASE ** attempt, BACKOFF_MAX) + random.uniform(0, 1)
+                await asyncio.sleep(wait_time)
+                logger.info(f"Чекаємо {wait_time:.1f}с перед повтором...")
 
         return [], "Не вдалося витягнути дані після всіх спроб", metadata
 

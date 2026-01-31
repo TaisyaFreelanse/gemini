@@ -1,7 +1,9 @@
 import aiohttp
 import asyncio
+import ssl
+import random
 from bs4 import BeautifulSoup
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 import logging
 from urllib.parse import urlparse, urljoin
 import re
@@ -10,6 +12,14 @@ from app.core.config import settings
 from app.core.cache import get_cache
 
 logger = logging.getLogger(__name__)
+
+# Константи
+MAX_TEXT_LENGTH = 50000
+MAX_LINKS_COUNT = 100
+MAX_HTML_LENGTH = 100000
+BACKOFF_BASE = 2
+BACKOFF_MAX = 30
+BACKOFF_JITTER = 0.1
 
 
 class WebScraper:
@@ -37,25 +47,108 @@ class WebScraper:
     ]
     
     def __init__(self, proxy_rotator: Optional[ProxyRotator] = None):
-        import random
         self.proxy_rotator = proxy_rotator
-        # connect=15 — час на підключення до проксі; total — на весь запит
         self.timeout = aiohttp.ClientTimeout(
             total=settings.SCRAPING_TIMEOUT,
             connect=15,
             sock_connect=15,
         )
         self.max_retries = settings.SCRAPING_MAX_RETRIES
-        self._random = random
+        
+        # Separate session pools for proxy and non-proxy connections
+        # This avoids issues with SSL context being shared between different modes
+        self._session_no_proxy: Optional[aiohttp.ClientSession] = None
+        self._session_with_proxy: Optional[aiohttp.ClientSession] = None
+        self._connector_no_proxy: Optional[aiohttp.TCPConnector] = None
+        self._connector_with_proxy: Optional[aiohttp.TCPConnector] = None
+        self._ssl_context_no_proxy: Optional[ssl.SSLContext] = None
+        self._ssl_context_with_proxy: Optional[ssl.SSLContext] = None
+    
+    def _create_ssl_context(self, for_proxy: bool = False) -> ssl.SSLContext:
+        """
+        Create a proper SSL context.
+        Never disables SSL verification - uses system CA bundle.
+        For proxy scenarios, still uses proper SSL with system certificates.
+        """
+        ssl_context = ssl.create_default_context()
+        # Always use proper SSL verification with system CA bundle
+        # ssl_context.check_hostname = True  # Already default
+        # ssl_context.verify_mode = ssl.CERT_REQUIRED  # Already default
+        
+        # Load system certificates
+        ssl_context.load_default_certs()
+        
+        return ssl_context
+    
+    async def _get_session(self, use_proxy: bool = False) -> aiohttp.ClientSession:
+        """
+        Отримати або створити HTTP сесію з connection pooling.
+        Maintains separate sessions for proxy and non-proxy connections.
+        """
+        if use_proxy:
+            if self._session_with_proxy is None or self._session_with_proxy.closed:
+                # Create proper SSL context (never disable verification)
+                self._ssl_context_with_proxy = self._create_ssl_context(for_proxy=True)
+                
+                # Connector з пулом з'єднань for proxy
+                self._connector_with_proxy = aiohttp.TCPConnector(
+                    ssl=self._ssl_context_with_proxy,
+                    limit=100,              # Максимум з'єднань
+                    limit_per_host=10,      # На хост
+                    ttl_dns_cache=300,      # DNS кеш 5 хв
+                    enable_cleanup_closed=True
+                )
+                self._session_with_proxy = aiohttp.ClientSession(
+                    timeout=self.timeout,
+                    connector=self._connector_with_proxy
+                )
+            return self._session_with_proxy
+        else:
+            if self._session_no_proxy is None or self._session_no_proxy.closed:
+                # Create proper SSL context
+                self._ssl_context_no_proxy = self._create_ssl_context(for_proxy=False)
+                
+                # Connector з пулом з'єднань for non-proxy
+                self._connector_no_proxy = aiohttp.TCPConnector(
+                    ssl=self._ssl_context_no_proxy,
+                    limit=100,              # Максимум з'єднань
+                    limit_per_host=10,      # На хост
+                    ttl_dns_cache=300,      # DNS кеш 5 хв
+                    enable_cleanup_closed=True
+                )
+                self._session_no_proxy = aiohttp.ClientSession(
+                    timeout=self.timeout,
+                    connector=self._connector_no_proxy
+                )
+            return self._session_no_proxy
+    
+    async def close(self):
+        """Закрити сесії та звільнити ресурси"""
+        # Close non-proxy session
+        if self._session_no_proxy and not self._session_no_proxy.closed:
+            await self._session_no_proxy.close()
+        self._session_no_proxy = None
+        self._connector_no_proxy = None
+        
+        # Close proxy session
+        if self._session_with_proxy and not self._session_with_proxy.closed:
+            await self._session_with_proxy.close()
+        self._session_with_proxy = None
+        self._connector_with_proxy = None
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
     
     def _get_headers(self, url: str) -> dict:
         """Отримати headers з випадковим User-Agent"""
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         domain = parsed.netloc or parsed.path.split('/')[0]
         
         return {
-            'User-Agent': self._random.choice(self.USER_AGENTS),
+            'User-Agent': random.choice(self.USER_AGENTS),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -113,12 +206,15 @@ class WebScraper:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
+        # Отримуємо сесію один раз
+        session = await self._get_session(use_proxy=use_proxy and self.proxy_rotator is not None)
+        
         for attempt in range(self.max_retries):
             proxy_base_url = None
             proxy_auth = None
 
             try:
-                # Отримуємо проксі (base_url + auth окремо — рекомендовано для aiohttp)
+                # Отримуємо проксі
                 if use_proxy and self.proxy_rotator:
                     parts = self.proxy_rotator.get_next_proxy_for_aiohttp(proxy_type="http")
                     if not parts:
@@ -127,30 +223,19 @@ class WebScraper:
                     proxy_base_url, login, password = parts
                     proxy_auth = aiohttp.BasicAuth(login, password) if (login and password) else None
 
-                # Виконуємо HTTP запит
                 headers = self._get_headers(url)
-                
-                # Вимикаємо перевірку SSL при використанні проксі (часто потрібно для datacenter проксі)
-                import ssl
-                ssl_context = ssl.create_default_context()
+                kwargs = {'headers': headers}
                 if proxy_base_url:
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
-                
-                connector = aiohttp.TCPConnector(ssl=ssl_context)
-                async with aiohttp.ClientSession(timeout=self.timeout, connector=connector) as session:
-                    kwargs = {'headers': headers}
-                    if proxy_base_url:
-                        kwargs['proxy'] = proxy_base_url
-                        if proxy_auth:
-                            kwargs['proxy_auth'] = proxy_auth
+                    kwargs['proxy'] = proxy_base_url
+                    if proxy_auth:
+                        kwargs['proxy_auth'] = proxy_auth
 
-                    logger.info(
-                        f"Спроба {attempt + 1}/{self.max_retries}: Завантаження {url}" +
-                        (f" через проксі {proxy_base_url}" if proxy_base_url else "")
-                    )
+                logger.info(
+                    f"Спроба {attempt + 1}/{self.max_retries}: Завантаження {url}" +
+                    (f" через проксі {proxy_base_url}" if proxy_base_url else "")
+                )
 
-                    async with session.get(url, **kwargs) as response:
+                async with session.get(url, **kwargs) as response:
                         if response.status == 200:
                             html_content = await response.text()
                             
@@ -206,15 +291,17 @@ class WebScraper:
                 if proxy_base_url and self.proxy_rotator:
                     self.proxy_rotator.mark_proxy_failed(proxy_base_url)
             
-            # Чекаємо перед наступною спробою (exponential backoff)
+            # Чекаємо перед наступною спробою (exponential backoff з jitter)
             if attempt < self.max_retries - 1:
-                wait_time = 2 ** attempt  # 1s, 2s, 4s
-                logger.info(f"Чекаємо {wait_time}с перед наступною спробою...")
+                base_wait = min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
+                jitter = random.uniform(0, base_wait * BACKOFF_JITTER)
+                wait_time = base_wait + jitter
+                logger.info(f"Чекаємо {wait_time:.1f}с перед наступною спробою...")
                 await asyncio.sleep(wait_time)
         
         return None, f"Не вдалося завантажити після {self.max_retries} спроб"
     
-    def extract_visible_content(self, html: str, base_url: str) -> Dict[str, any]:
+    def extract_visible_content(self, html: str, base_url: str) -> Dict[str, Any]:
         """
         Витягнути видимий контент з HTML
         
@@ -268,13 +355,13 @@ class WebScraper:
         
         return {
             'title': title.strip() if title else "",
-            'text': text[:50000],  # Обмежуємо розмір тексту
-            'links': links[:100],  # Обмежуємо кількість посилань
+            'text': text[:MAX_TEXT_LENGTH],
+            'links': links[:MAX_LINKS_COUNT],
             'meta_description': meta_desc.strip() if meta_desc else "",
-            'clean_html': clean_html[:100000]  # Обмежуємо розмір HTML для Gemini
+            'clean_html': clean_html[:MAX_HTML_LENGTH]
         }
     
-    async def scrape_domain(self, domain: str, use_proxy: bool = True, use_cache: bool = True) -> Dict[str, any]:
+    async def scrape_domain(self, domain: str, use_proxy: bool = True, use_cache: bool = True) -> Dict[str, Any]:
         """
         Повний цикл парсингу домену з підтримкою кешування
         
@@ -310,12 +397,18 @@ class WebScraper:
             'cached': False
         }
         
-        # Спробувати отримати з кешу
+        # Отримуємо кеш один раз
+        cache = None
         if use_cache:
             try:
                 cache = await get_cache()
+            except Exception as e:
+                logger.warning(f"Помилка ініціалізації кешу: {e}")
+        
+        # Спробувати отримати з кешу
+        if cache:
+            try:
                 cached_data = await cache.get_html(domain)
-                
                 if cached_data:
                     result['success'] = True
                     result['html_raw'] = cached_data.get('html_raw')
@@ -335,9 +428,8 @@ class WebScraper:
             result['content'] = self.extract_visible_content(html, url)
             
             # Зберегти в кеш
-            if use_cache:
+            if cache:
                 try:
-                    cache = await get_cache()
                     await cache.set_html(domain, {
                         'html_raw': html,
                         'content': result['content']

@@ -3,7 +3,7 @@ CRUD (Create, Read, Update, Delete) операції для роботи з БД
 """
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, update
 from datetime import datetime
 
 from app.models.domain import Domain
@@ -113,6 +113,57 @@ def update_scraping_session(
     return session
 
 
+def atomic_increment_session_counters(
+    db: Session,
+    session_id: int,
+    success: bool
+) -> Optional[ScrapingSession]:
+    """
+    Атомно оновити лічильники сесії (без race conditions)
+    Використовує SELECT FOR UPDATE для блокування рядка перед перевіркою та оновленням.
+    Це запобігає TOCTOU race condition між перевіркою processed_domains >= total_domains
+    і оновленням status/completed_at.
+    """
+    from sqlalchemy import text
+    
+    # Спочатку атомно оновлюємо лічильники
+    values = {
+        ScrapingSession.processed_domains: ScrapingSession.processed_domains + 1
+    }
+    if success:
+        values[ScrapingSession.successful_domains] = ScrapingSession.successful_domains + 1
+    else:
+        values[ScrapingSession.failed_domains] = ScrapingSession.failed_domains + 1
+    
+    stmt = (
+        update(ScrapingSession)
+        .where(ScrapingSession.id == session_id)
+        .values(**values)
+    )
+    db.execute(stmt)
+    db.flush()  # Flush to apply the update but keep transaction open
+    
+    # Тепер робимо SELECT FOR UPDATE щоб атомно перевірити і оновити статус
+    # Це блокує рядок для інших транзакцій до завершення нашої
+    session = db.query(ScrapingSession).filter(
+        ScrapingSession.id == session_id
+    ).with_for_update().first()
+    
+    if session and session.processed_domains >= session.total_domains:
+        # Тільки оновлюємо статус якщо він ще не "completed" або "failed"
+        if session.status not in ("completed", "failed"):
+            session.status = "completed"
+            session.completed_at = datetime.utcnow()
+    
+    db.commit()
+    
+    # Повертаємо оновлену сесію
+    if session:
+        db.refresh(session)
+    
+    return session
+
+
 # ========== Scraped Deals ==========
 
 def create_scraped_deal(
@@ -146,7 +197,8 @@ def get_scraped_deals(
     if session_id:
         query = query.filter(ScrapedDeal.session_id == session_id)
     if domain:
-        query = query.filter(ScrapedDeal.domain == domain)
+        # Частковий пошук по домену (ilike для case-insensitive)
+        query = query.filter(ScrapedDeal.domain.ilike(f"%{domain}%"))
     
     return query.order_by(desc(ScrapedDeal.created_at)).offset(skip).limit(limit).all()
 
