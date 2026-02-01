@@ -21,7 +21,7 @@
 - SQLAlchemy (ORM)
 - Gemini AI API
 - BeautifulSoup4 (парсинг HTML)
-
+.
 **Frontend:**
 - React 18 + Vite
 - Tailwind CSS
