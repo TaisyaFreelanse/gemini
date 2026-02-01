@@ -9,6 +9,8 @@ app = FastAPI(
 )
 
 # CORS: with allow_credentials=True, "*" is invalid — use explicit origins
+import os
+
 _CORS_ORIGINS = [
     "http://localhost",
     "http://localhost:5173",
@@ -16,7 +18,15 @@ _CORS_ORIGINS = [
     "http://127.0.0.1",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
+    # Render domains
+    "https://gemini-scraper-frontend.onrender.com",
+    "https://gemini-scraper-backend.onrender.com",
 ]
+
+# Add custom CORS origin from environment if set
+_extra_cors = os.getenv("CORS_ORIGINS", "")
+if _extra_cors:
+    _CORS_ORIGINS.extend([origin.strip() for origin in _extra_cors.split(",") if origin.strip()])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
