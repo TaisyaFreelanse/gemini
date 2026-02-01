@@ -61,7 +61,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: scraper-celery-worker
-    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=1
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=5
     environment:
       DATABASE_URL: postgresql://scraper_user:${POSTGRES_PASSWORD:-changeme}@postgres:5432/scraper_db
       REDIS_URL: redis://redis:6379/0

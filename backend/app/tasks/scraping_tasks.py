@@ -145,6 +145,8 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
     }
     
     # Крок 1: Завантажуємо HTML через WebScraper
+    scraper = None
+    scraped_data = None
     try:
         # Створюємо scraper з проксі якщо є конфігурація
         proxy_config = config.get('proxy')
@@ -156,21 +158,31 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
         # use_cache=False — async Redis кеш дає "Event loop is closed" у Celery
         scraped_data = await scraper.scrape_domain(domain, use_proxy=bool(proxy_config), use_cache=False)
         
-        if not scraped_data['success']:
-            error_msg = scraped_data.get('error', 'Scraping failed')
-            result['error'] = error_msg
-            _add_ui_log("ERROR", f"Помилка завантаження {domain}: {error_msg[:100]}", domain)
-            return result
-        
-        html_len = len(scraped_data.get('html_raw', ''))
-        result['metadata']['html_length'] = html_len
-        _add_ui_log("INFO", f"✓ Завантажено HTML для {domain} ({html_len} байт)", domain, {"html_length": html_len})
-        
     except Exception as e:
         logger.error(f"Помилка WebScraper для {domain}: {e}")
         _add_ui_log("ERROR", f"WebScraper помилка для {domain}: {str(e)[:100]}", domain)
         result['error'] = f"WebScraper error: {str(e)}"
+    finally:
+        # Закриваємо HTTP сесію
+        if scraper:
+            try:
+                await scraper.close()
+            except Exception:
+                pass
+    
+    # Перевіряємо результат scraping
+    if scraped_data is None:
         return result
+    
+    if not scraped_data['success']:
+        error_msg = scraped_data.get('error', 'Scraping failed')
+        result['error'] = error_msg
+        _add_ui_log("ERROR", f"Помилка завантаження {domain}: {error_msg[:100]}", domain)
+        return result
+    
+    html_len = len(scraped_data.get('html_raw', ''))
+    result['metadata']['html_length'] = html_len
+    _add_ui_log("INFO", f"✓ Завантажено HTML для {domain} ({html_len} байт)", domain, {"html_length": html_len})
     
     # Перевірка зупинки перед Gemini
     if _is_stop_requested():

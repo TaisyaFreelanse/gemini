@@ -120,20 +120,16 @@ def atomic_increment_session_counters(
 ) -> Optional[ScrapingSession]:
     """
     Атомно оновити лічильники сесії (без race conditions)
-    Використовує SELECT FOR UPDATE для блокування рядка перед перевіркою та оновленням.
-    Це запобігає TOCTOU race condition між перевіркою processed_domains >= total_domains
-    і оновленням status/completed_at.
+    Використовує SQL UPDATE SET x = x + 1 для атомності
     """
-    from sqlalchemy import text
-    
-    # Спочатку атомно оновлюємо лічильники
+    # Атомно оновлюємо лічильники - використовуємо dict без unpacking
     values = {
-        ScrapingSession.processed_domains: ScrapingSession.processed_domains + 1
+        "processed_domains": ScrapingSession.processed_domains + 1
     }
     if success:
-        values[ScrapingSession.successful_domains] = ScrapingSession.successful_domains + 1
+        values["successful_domains"] = ScrapingSession.successful_domains + 1
     else:
-        values[ScrapingSession.failed_domains] = ScrapingSession.failed_domains + 1
+        values["failed_domains"] = ScrapingSession.failed_domains + 1
     
     stmt = (
         update(ScrapingSession)
@@ -141,25 +137,20 @@ def atomic_increment_session_counters(
         .values(**values)
     )
     db.execute(stmt)
-    db.flush()  # Flush to apply the update but keep transaction open
+    db.commit()
     
-    # Тепер робимо SELECT FOR UPDATE щоб атомно перевірити і оновити статус
-    # Це блокує рядок для інших транзакцій до завершення нашої
+    # Перевіряємо чи всі домени оброблені
     session = db.query(ScrapingSession).filter(
         ScrapingSession.id == session_id
-    ).with_for_update().first()
+    ).first()
     
     if session and session.processed_domains >= session.total_domains:
         # Тільки оновлюємо статус якщо він ще не "completed" або "failed"
         if session.status not in ("completed", "failed"):
             session.status = "completed"
             session.completed_at = datetime.utcnow()
-    
-    db.commit()
-    
-    # Повертаємо оновлену сесію
-    if session:
-        db.refresh(session)
+            db.commit()
+            db.refresh(session)
     
     return session
 
