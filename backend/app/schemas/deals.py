@@ -12,7 +12,7 @@ class DealSchema(BaseModel):
     code: str = Field(..., description="Промокод або 'Не знайдено'")
     date_start: Optional[str] = Field(None, description="Дата початку (YYYY-MM-DD HH:MM)")
     date_end: Optional[str] = Field(None, description="Дата закінчення (YYYY-MM-DD HH:MM)")
-    offer_type: int = Field(..., ge=1, le=10, description="Тип акції (1-10)")
+    offer_type: int = Field(..., ge=0, le=10, description="Тип акції (0-10, 0 = не визначено)")
     target_url: str = Field(..., description="URL акції")
     click_url: str = Field(default="Не знайдено", description="Click URL або 'Не знайдено'")
     discount: str = Field(default="Не знайдено", description="Розмір знижки або 'Не знайдено'")
