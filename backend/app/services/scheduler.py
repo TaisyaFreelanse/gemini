@@ -121,10 +121,27 @@ class SchedulerService:
     
     def start(self):
         """Запустити scheduler"""
+        print(f"  SchedulerService.start() called, _is_running={self._is_running}", flush=True)
         if not self._is_running:
-            self.scheduler.start()
-            self._is_running = True
-            logger.info("✓ Scheduler запущено")
+            try:
+                # Для AsyncIOScheduler потрібен event loop
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    print(f"  Event loop found: {loop}", flush=True)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    print(f"  Created new event loop: {loop}", flush=True)
+                
+                self.scheduler.start()
+                self._is_running = True
+                print(f"  ✓ Scheduler started successfully, state: {self.scheduler.state}", flush=True)
+                logger.info("✓ Scheduler запущено")
+            except Exception as e:
+                print(f"  ✗ Scheduler start error: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
         else:
             logger.warning("Scheduler вже запущений")
     

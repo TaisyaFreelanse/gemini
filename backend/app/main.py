@@ -10,19 +10,39 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
+    print("🚀 LIFESPAN STARTUP BEGIN", flush=True)
+    
     # Startup: запускаем scheduler
-    from app.services.scheduler import get_scheduler
-    scheduler = get_scheduler()
-    if not scheduler.is_running():
-        scheduler.start()
-        logger.info("✓ Scheduler запущено при старті FastAPI")
+    try:
+        from app.services.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        print(f"  Scheduler instance: {scheduler}", flush=True)
+        print(f"  Scheduler running before start: {scheduler.is_running()}", flush=True)
+        
+        if not scheduler.is_running():
+            scheduler.start()
+            print(f"  Scheduler running after start: {scheduler.is_running()}", flush=True)
+            logger.info("✓ Scheduler запущено при старті FastAPI")
+        
+        print("✅ LIFESPAN STARTUP COMPLETE", flush=True)
+    except Exception as e:
+        print(f"❌ LIFESPAN STARTUP ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
     
     yield
     
     # Shutdown: зупиняємо scheduler
-    if scheduler.is_running():
-        scheduler.shutdown(wait=False)
-        logger.info("✓ Scheduler зупинено при завершенні FastAPI")
+    print("🛑 LIFESPAN SHUTDOWN BEGIN", flush=True)
+    try:
+        from app.services.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        if scheduler.is_running():
+            scheduler.shutdown(wait=False)
+            logger.info("✓ Scheduler зупинено при завершенні FastAPI")
+        print("✅ LIFESPAN SHUTDOWN COMPLETE", flush=True)
+    except Exception as e:
+        print(f"❌ LIFESPAN SHUTDOWN ERROR: {e}", flush=True)
 
 
 app = FastAPI(
