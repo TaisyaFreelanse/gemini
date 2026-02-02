@@ -43,6 +43,45 @@ def _redis_int(key: str, default: int) -> int:
         return default
 
 
+REDIS_JOBS_KEY = "scheduler:jobs"
+
+
+def _save_job_to_redis(job_id: str, job_data: Dict):
+    """Зберегти job в Redis для відновлення після рестарту"""
+    try:
+        r = _get_redis()
+        r.hset(REDIS_JOBS_KEY, job_id, json.dumps(job_data))
+        print(f"  ✓ Job {job_id} saved to Redis", flush=True)
+    except Exception as e:
+        print(f"  ✗ Failed to save job {job_id} to Redis: {e}", flush=True)
+
+
+def _delete_job_from_redis(job_id: str):
+    """Видалити job з Redis"""
+    try:
+        r = _get_redis()
+        r.hdel(REDIS_JOBS_KEY, job_id)
+        print(f"  ✓ Job {job_id} deleted from Redis", flush=True)
+    except Exception as e:
+        print(f"  ✗ Failed to delete job {job_id} from Redis: {e}", flush=True)
+
+
+def _get_saved_jobs_from_redis() -> Dict[str, Dict]:
+    """Отримати збережені jobs з Redis"""
+    try:
+        r = _get_redis()
+        jobs_raw = r.hgetall(REDIS_JOBS_KEY)
+        jobs = {}
+        for job_id, job_data in jobs_raw.items():
+            job_id_str = job_id.decode() if isinstance(job_id, bytes) else job_id
+            job_data_str = job_data.decode() if isinstance(job_data, bytes) else job_data
+            jobs[job_id_str] = json.loads(job_data_str)
+        return jobs
+    except Exception as e:
+        print(f"  ✗ Failed to get jobs from Redis: {e}", flush=True)
+        return {}
+
+
 def _get_current_config() -> Dict:
     """
     Отримати актуальну конфігурацію з Redis та .env
@@ -138,12 +177,62 @@ class SchedulerService:
                 self._is_running = True
                 print(f"  ✓ Scheduler started successfully, state: {self.scheduler.state}", flush=True)
                 logger.info("✓ Scheduler запущено")
+                
+                # Відновлюємо збережені jobs з Redis
+                self._restore_jobs_from_redis()
+                
             except Exception as e:
                 print(f"  ✗ Scheduler start error: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
         else:
             logger.warning("Scheduler вже запущений")
+    
+    def _restore_jobs_from_redis(self):
+        """Відновити збережені jobs з Redis після рестарту"""
+        print("  Restoring jobs from Redis...", flush=True)
+        saved_jobs = _get_saved_jobs_from_redis()
+        
+        if not saved_jobs:
+            print("  No saved jobs found in Redis", flush=True)
+            return
+        
+        print(f"  Found {len(saved_jobs)} saved jobs in Redis", flush=True)
+        
+        for job_id, job_data in saved_jobs.items():
+            try:
+                job_type = job_data.get('type')
+                cron_expression = job_data.get('cron_expression')
+                domains = job_data.get('domains', [])
+                
+                print(f"  Restoring job {job_id}: type={job_type}, cron={cron_expression}, domains={len(domains)}", flush=True)
+                
+                if job_type == 'full_scraping' and domains:
+                    # Відновлюємо full_scraping job
+                    self.schedule_full_scraping(
+                        cron_expression=cron_expression,
+                        domains=domains,
+                        config=None,
+                        save_to_redis=False  # Не зберігати повторно
+                    )
+                    print(f"  ✓ Job {job_id} restored successfully", flush=True)
+                elif job_type == 'partial_scraping' and domains:
+                    batch_size = job_data.get('batch_size', 500)
+                    self.schedule_partial_scraping(
+                        cron_expression=cron_expression,
+                        all_domains=domains,
+                        batch_size=batch_size,
+                        config=None,
+                        save_to_redis=False
+                    )
+                    print(f"  ✓ Job {job_id} restored successfully", flush=True)
+                else:
+                    print(f"  ⚠ Unknown job type or empty domains: {job_type}", flush=True)
+                    
+            except Exception as e:
+                print(f"  ✗ Failed to restore job {job_id}: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
     
     def shutdown(self, wait: bool = True):
         """
@@ -303,6 +392,8 @@ class SchedulerService:
         """
         try:
             self.scheduler.remove_job(job_id)
+            # Видаляємо з Redis також
+            _delete_job_from_redis(job_id)
             logger.info(f"✓ Задачу '{job_id}' видалено")
             return True
         except Exception as e:
@@ -361,7 +452,8 @@ class SchedulerService:
         self,
         cron_expression: str,
         domains: List[str],
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        save_to_redis: bool = True
     ) -> Optional[Job]:
         """
         Запланувати повний парсинг всіх доменів
@@ -370,6 +462,7 @@ class SchedulerService:
             cron_expression: Cron вираз (напр. "0 0 * * *")
             domains: Список доменів для парсингу
             config: Додаткова конфігурація (ігнорується, читається з Redis/.env)
+            save_to_redis: Зберігати в Redis для відновлення після рестарту
         
         Returns:
             Job instance або None
@@ -380,8 +473,17 @@ class SchedulerService:
         
         job_id = "full_scraping"
         
+        # Зберігаємо в Redis для відновлення після рестарту
+        if save_to_redis:
+            _save_job_to_redis(job_id, {
+                'type': 'full_scraping',
+                'cron_expression': cron_expression,
+                'domains': domains
+            })
+        
         def run_full_scraping():
             """Wrapper для синхронного виклику Celery task"""
+            print(f"🚀 CRON JOB TRIGGERED: run_full_scraping at {datetime.now()}", flush=True)
             logger.info("🚀 CRON JOB TRIGGERED: run_full_scraping")
             try:
                 # Читаємо актуальний конфіг в момент запуску (не при створенні job)
@@ -393,17 +495,21 @@ class SchedulerService:
                 try:
                     db_session = crud.create_scraping_session(db, total_domains=len(domains))
                     session_id = db_session.id
+                    print(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}", flush=True)
                     logger.info(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
                     
                     result = start_batch_scraping.delay(domains, session_id, runtime_config)
+                    print(f"✓ Celery task запущено: {result.id}", flush=True)
                     logger.info(f"✓ Celery task запущено: {result.id}")
                 except Exception as e:
+                    print(f"✗ Помилка створення сесії парсингу: {e}", flush=True)
                     logger.error(f"✗ Помилка створення сесії парсингу: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
                 finally:
                     db.close()
             except Exception as e:
+                print(f"✗ CRON JOB ERROR: {e}", flush=True)
                 logger.error(f"✗ CRON JOB ERROR: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
@@ -420,7 +526,8 @@ class SchedulerService:
         cron_expression: str,
         all_domains: List[str],
         batch_size: int = 500,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        save_to_redis: bool = True
     ) -> Optional[Job]:
         """
         Запланувати частковий парсинг (N доменів за раз)
@@ -430,6 +537,7 @@ class SchedulerService:
             all_domains: Повний список доменів
             batch_size: Кількість доменів в одній пачці
             config: Додаткова конфігурація (ігнорується, читається з Redis/.env)
+            save_to_redis: Зберігати в Redis для відновлення після рестарту
         
         Returns:
             Job instance або None
@@ -440,6 +548,15 @@ class SchedulerService:
         import random
         
         job_id = "partial_scraping"
+        
+        # Зберігаємо в Redis для відновлення після рестарту
+        if save_to_redis:
+            _save_job_to_redis(job_id, {
+                'type': 'partial_scraping',
+                'cron_expression': cron_expression,
+                'domains': all_domains,
+                'batch_size': batch_size
+            })
         
         def run_partial_scraping():
             """Wrapper для часткового парсингу"""
