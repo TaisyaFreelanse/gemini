@@ -509,6 +509,10 @@ class SchedulerService:
                     # Позначаємо активну сесію в Redis (TTL 2 години)
                     r.setex("parsing:active_session", 7200, str(session_id))
                     
+                    # Встановлюємо статус для Dashboard
+                    r.set("scraping:status", "running")
+                    r.set("scraping:session_id", str(session_id))
+                    
                     print(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}", flush=True)
                     logger.info(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
                     
@@ -586,8 +590,23 @@ class SchedulerService:
             # Створюємо сесію в БД
             db = SessionLocal()
             try:
+                r = _get_redis()
+                
+                # Перевіряємо чи є активна сесія парсингу
+                active_session = r.get("parsing:active_session")
+                if active_session:
+                    active_session_id = active_session.decode() if isinstance(active_session, bytes) else active_session
+                    logger.warning(f"Пропускаємо запуск: активна сесія {active_session_id} ще не завершена")
+                    return
+                
                 db_session = crud.create_scraping_session(db, total_domains=len(domains_batch))
                 session_id = db_session.id
+                
+                # Позначаємо активну сесію в Redis
+                r.setex("parsing:active_session", 7200, str(session_id))
+                r.set("scraping:status", "running")
+                r.set("scraping:session_id", str(session_id))
+                
                 logger.info(
                     f"Запуск часткового парсингу: {len(domains_batch)}/{len(all_domains)} доменів, "
                     f"сесія {session_id}"
