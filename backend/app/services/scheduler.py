@@ -196,8 +196,17 @@ class SchedulerService:
             expr = ' '.join(parts)
             trigger = CronTrigger.from_crontab(expr, timezone='UTC')
             
+            # Обгортка для логування виклику
+            def job_wrapper(*a, **kw):
+                logger.info(f"🔔 CRON TRIGGER FIRED: {job_id}")
+                try:
+                    return func(*a, **kw)
+                except Exception as e:
+                    logger.error(f"✗ Job {job_id} failed: {e}")
+                    raise
+            
             job = self.scheduler.add_job(
-                func=func,
+                func=job_wrapper,
                 trigger=trigger,
                 id=job_id,
                 args=args,
@@ -209,6 +218,7 @@ class SchedulerService:
                 f"✓ Додано cron задачу '{job_id}': {cron_expression} "
                 f"(наступний запуск: {job.next_run_time})"
             )
+            logger.info(f"  Scheduler running: {self._is_running}, Jobs count: {len(self.scheduler.get_jobs())}")
             
             return job
             
@@ -355,22 +365,31 @@ class SchedulerService:
         
         def run_full_scraping():
             """Wrapper для синхронного виклику Celery task"""
-            # Читаємо актуальний конфіг в момент запуску (не при створенні job)
-            runtime_config = _get_current_config()
-            
-            # Створюємо сесію в БД
-            db = SessionLocal()
+            logger.info("🚀 CRON JOB TRIGGERED: run_full_scraping")
             try:
-                db_session = crud.create_scraping_session(db, total_domains=len(domains))
-                session_id = db_session.id
-                logger.info(f"Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
+                # Читаємо актуальний конфіг в момент запуску (не при створенні job)
+                runtime_config = _get_current_config()
+                logger.info(f"Config loaded, proxy: {runtime_config.get('proxy', {}).get('host', 'none')}")
                 
-                result = start_batch_scraping.delay(domains, session_id, runtime_config)
-                logger.info(f"Celery task запущено: {result.id}")
+                # Створюємо сесію в БД
+                db = SessionLocal()
+                try:
+                    db_session = crud.create_scraping_session(db, total_domains=len(domains))
+                    session_id = db_session.id
+                    logger.info(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
+                    
+                    result = start_batch_scraping.delay(domains, session_id, runtime_config)
+                    logger.info(f"✓ Celery task запущено: {result.id}")
+                except Exception as e:
+                    logger.error(f"✗ Помилка створення сесії парсингу: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                finally:
+                    db.close()
             except Exception as e:
-                logger.error(f"Помилка створення сесії парсингу: {e}")
-            finally:
-                db.close()
+                logger.error(f"✗ CRON JOB ERROR: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
         
         return self.add_cron_job(
             job_id=job_id,
