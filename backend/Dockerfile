@@ -50,8 +50,15 @@ RUN chown -R appuser:appuser /app
 # Switch to appuser for running
 USER appuser
 
+# Copy and setup startup script
+COPY start.sh /app/start.sh
+USER root
+RUN chmod +x /app/start.sh
+RUN chown appuser:appuser /app/start.sh
+USER appuser
+
 # Expose port
 EXPOSE 8000
 
-# Run migrations and start application
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Run startup script (migrations + celery worker + uvicorn)
+CMD ["/app/start.sh"]
