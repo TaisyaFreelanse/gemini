@@ -351,6 +351,85 @@ async def stop_parsing(db: Session = Depends(get_db)):
     }
 
 
+@router.post("/clear-queue")
+async def clear_celery_queue():
+    """
+    Очистити чергу Celery від накопичених задач.
+    
+    Видаляє:
+    - Всі задачі з черги Celery
+    - Флаг активної сесії парсингу
+    - Збережені task_ids
+    - Скидає статус на idle
+    """
+    import logging
+    from app.tasks.celery_app import celery_app
+    
+    logger = logging.getLogger(__name__)
+    
+    results = {
+        "queue_purged": False,
+        "active_session_cleared": False,
+        "task_ids_cleared": False,
+        "status_reset": False,
+        "errors": []
+    }
+    
+    # 1. Purge черги Celery
+    try:
+        purge_result = celery_app.control.purge()
+        results["queue_purged"] = True
+        results["purged_count"] = purge_result if isinstance(purge_result, int) else 0
+        logger.info(f"Черга Celery очищена: {purge_result}")
+    except Exception as e:
+        logger.error(f"Помилка очищення черги Celery: {e}")
+        results["errors"].append(f"Purge error: {str(e)}")
+    
+    # 2. Видаляємо флаг активної сесії
+    try:
+        deleted = redis_client.delete("parsing:active_session")
+        results["active_session_cleared"] = deleted > 0
+        logger.info(f"Флаг active_session видалено: {deleted}")
+    except Exception as e:
+        logger.error(f"Помилка видалення active_session: {e}")
+        results["errors"].append(f"Active session error: {str(e)}")
+    
+    # 3. Видаляємо збережені task_ids
+    try:
+        deleted = redis_client.delete("scraping:task_ids")
+        results["task_ids_cleared"] = deleted > 0
+    except Exception as e:
+        results["errors"].append(f"Task IDs error: {str(e)}")
+    
+    # 4. Скидаємо статус парсингу
+    try:
+        redis_client.set("scraping:status", "idle")
+        redis_client.delete("scraping:session_id")
+        redis_client.delete("scraping:stop_requested")
+        results["status_reset"] = True
+    except Exception as e:
+        results["errors"].append(f"Status reset error: {str(e)}")
+    
+    # 5. Видаляємо всі ключі прогресу сесій
+    try:
+        progress_keys = redis_client.keys("session:*:progress")
+        if progress_keys:
+            redis_client.delete(*progress_keys)
+            results["progress_keys_cleared"] = len(progress_keys)
+        else:
+            results["progress_keys_cleared"] = 0
+    except Exception as e:
+        results["errors"].append(f"Progress keys error: {str(e)}")
+    
+    success = len(results["errors"]) == 0
+    
+    return {
+        "success": success,
+        "message": "Черга Celery очищена" if success else "Часткова очистка з помилками",
+        "details": results
+    }
+
+
 def _idle_status() -> ParsingStatusResponse:
     """Повернути порожній статус (idle). Використовується при помилках або відсутності сесії."""
     from datetime import datetime
