@@ -485,7 +485,17 @@ class SchedulerService:
             """Wrapper для синхронного виклику Celery task"""
             print(f"🚀 CRON JOB TRIGGERED: run_full_scraping at {datetime.now()}", flush=True)
             logger.info("🚀 CRON JOB TRIGGERED: run_full_scraping")
+            
             try:
+                # Перевіряємо чи є активна сесія парсингу
+                r = _get_redis()
+                active_session = r.get("parsing:active_session")
+                if active_session:
+                    active_session_id = active_session.decode() if isinstance(active_session, bytes) else active_session
+                    print(f"⏭ Пропускаємо: активна сесія {active_session_id} ще не завершена", flush=True)
+                    logger.warning(f"Пропускаємо запуск: активна сесія {active_session_id} ще не завершена")
+                    return
+                
                 # Читаємо актуальний конфіг в момент запуску (не при створенні job)
                 runtime_config = _get_current_config()
                 logger.info(f"Config loaded, proxy: {runtime_config.get('proxy', {}).get('host', 'none')}")
@@ -495,6 +505,10 @@ class SchedulerService:
                 try:
                     db_session = crud.create_scraping_session(db, total_domains=len(domains))
                     session_id = db_session.id
+                    
+                    # Позначаємо активну сесію в Redis (TTL 2 години)
+                    r.setex("parsing:active_session", 7200, str(session_id))
+                    
                     print(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}", flush=True)
                     logger.info(f"✓ Запуск повного парсингу: {len(domains)} доменів, сесія {session_id}")
                     

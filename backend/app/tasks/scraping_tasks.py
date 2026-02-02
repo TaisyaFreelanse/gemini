@@ -418,8 +418,13 @@ def _update_session_in_db(session_id: int, result: Dict):
                 # Оновлюємо статус в Redis
                 if session.status == "completed":
                     redis_client.set("scraping:status", "completed")
+                    # Очищаємо active_session щоб дозволити наступний запуск
+                    redis_client.delete("parsing:active_session")
+                    logger.info(f"✓ Сесія {session_id} завершена, active_session очищено")
                 elif session.status == "failed":
                     redis_client.set("scraping:status", "failed")
+                    # Також очищаємо при помилці
+                    redis_client.delete("parsing:active_session")
                 
                 logger.debug(
                     f"Оновлено сесію {session_id}: "
