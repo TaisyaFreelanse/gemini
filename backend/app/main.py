@@ -1,11 +1,35 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.rate_limiter import rate_limit_middleware
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup: запускаем scheduler
+    from app.services.scheduler import get_scheduler
+    scheduler = get_scheduler()
+    if not scheduler.is_running():
+        scheduler.start()
+        logger.info("✓ Scheduler запущено при старті FastAPI")
+    
+    yield
+    
+    # Shutdown: зупиняємо scheduler
+    if scheduler.is_running():
+        scheduler.shutdown(wait=False)
+        logger.info("✓ Scheduler зупинено при завершенні FastAPI")
+
 
 app = FastAPI(
     title="Web Scraper Gemini API",
     description="API для парсингу сайтів з промокодами через Gemini AI",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS: with allow_credentials=True, "*" is invalid — use explicit origins
