@@ -12,10 +12,13 @@ export default function Scheduler() {
     job_type: 'full_scraping',
     domains: '',
     batch_size: 500,
-    useUploadedDomains: true,  // за замовчуванням використовувати завантажені домени
+    domainSource: 'uploaded',  // 'uploaded', 'manual', 'api'
   });
   const [message, setMessage] = useState(null);
   const [uploadedDomainsCount, setUploadedDomainsCount] = useState(0);
+  const [apiUrl, setApiUrl] = useState('');
+  const [apiDomains, setApiDomains] = useState([]);
+  const [apiLoading, setApiLoading] = useState(false);
 
   useEffect(() => {
     fetchStatus();
@@ -60,6 +63,26 @@ export default function Scheduler() {
     }
   };
 
+  const fetchDomainsFromApi = async () => {
+    if (!apiUrl.trim()) {
+      setMessage({ type: 'error', text: 'Введіть URL API' });
+      return;
+    }
+    
+    setApiLoading(true);
+    try {
+      const response = await schedulerAPI.fetchDomainsFromApi(apiUrl);
+      const domains = response.data.domains || [];
+      setApiDomains(domains);
+      setMessage({ type: 'success', text: `Завантажено ${domains.length} доменів з API` });
+    } catch (err) {
+      setMessage({ type: 'error', text: `Помилка завантаження: ${err.response?.data?.detail || err.message}` });
+      setApiDomains([]);
+    } finally {
+      setApiLoading(false);
+    }
+  };
+
   const handleAddJob = async (e) => {
     e.preventDefault();
     
@@ -72,7 +95,7 @@ export default function Scheduler() {
     try {
       let domains = [];
       
-      if (newJob.useUploadedDomains) {
+      if (newJob.domainSource === 'uploaded') {
         // Отримуємо завантажені домени
         const response = await configAPI.getDomains();
         domains = response.data.domains || [];
@@ -80,13 +103,20 @@ export default function Scheduler() {
           setMessage({ type: 'error', text: 'Немає завантажених доменів. Завантажте JSON файл у Configuration.' });
           return;
         }
-      } else {
+      } else if (newJob.domainSource === 'manual') {
         // Парсимо введені вручну
         domains = newJob.domains.split('\n').map(d => d.trim()).filter(Boolean);
         if (domains.length === 0) {
           setMessage({ type: 'error', text: 'Введіть хоча б один домен' });
           return;
         }
+      } else if (newJob.domainSource === 'api') {
+        // Використовуємо завантажені з API
+        if (apiDomains.length === 0) {
+          setMessage({ type: 'error', text: 'Спочатку завантажте домени з API' });
+          return;
+        }
+        domains = apiDomains;
       }
       
       // Використовуємо введений ID або генеруємо автоматично
@@ -108,8 +138,10 @@ export default function Scheduler() {
         job_type: 'full_scraping',
         domains: '',
         batch_size: 500,
-        useUploadedDomains: true,
+        domainSource: 'uploaded',
       });
+      setApiUrl('');
+      setApiDomains([]);
       fetchStatus();
     } catch (err) {
       setMessage({ type: 'error', text: `Помилка: ${err.response?.data?.detail || err.message}` });
@@ -330,8 +362,8 @@ export default function Scheduler() {
                   <input
                     type="radio"
                     name="domainSource"
-                    checked={newJob.useUploadedDomains}
-                    onChange={() => setNewJob({...newJob, useUploadedDomains: true})}
+                    checked={newJob.domainSource === 'uploaded'}
+                    onChange={() => setNewJob({...newJob, domainSource: 'uploaded'})}
                     className="w-4 h-4 text-blue-600"
                   />
                   <span className="text-sm">
@@ -345,20 +377,86 @@ export default function Scheduler() {
                     </span>
                   </span>
                 </label>
+                
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="radio"
                     name="domainSource"
-                    checked={!newJob.useUploadedDomains}
-                    onChange={() => setNewJob({...newJob, useUploadedDomains: false})}
+                    checked={newJob.domainSource === 'api'}
+                    onChange={() => setNewJob({...newJob, domainSource: 'api'})}
+                    className="w-4 h-4 text-blue-600"
+                  />
+                  <span className="text-sm">
+                    Завантажити з API
+                    {apiDomains.length > 0 && (
+                      <span className="ml-2 px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700">
+                        {apiDomains.length} доменів
+                      </span>
+                    )}
+                  </span>
+                </label>
+                
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="domainSource"
+                    checked={newJob.domainSource === 'manual'}
+                    onChange={() => setNewJob({...newJob, domainSource: 'manual'})}
                     className="w-4 h-4 text-blue-600"
                   />
                   <span className="text-sm">Ввести вручну</span>
                 </label>
               </div>
 
+              {/* Поле для API URL */}
+              {newJob.domainSource === 'api' && (
+                <div className="mb-3 p-3 bg-purple-50 border border-purple-200 rounded-md">
+                  <label className="block text-sm font-medium text-purple-700 mb-2">
+                    URL API для отримання доменів
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={apiUrl}
+                      onChange={(e) => setApiUrl(e.target.value)}
+                      className="flex-1 px-3 py-2 border border-purple-300 rounded-md text-sm"
+                      placeholder="https://example.com/api/shops?key=xxx"
+                    />
+                    <button
+                      type="button"
+                      onClick={fetchDomainsFromApi}
+                      disabled={apiLoading}
+                      className="px-4 py-2 bg-purple-600 text-white font-medium rounded-md hover:bg-purple-700 disabled:bg-purple-300"
+                    >
+                      {apiLoading ? '⏳' : '🔄 Завантажити'}
+                    </button>
+                  </div>
+                  <p className="mt-2 text-xs text-purple-600">
+                    Формат відповіді: {"{"}"data": [{"{"}"url": "https://shop.com/", ...{"}"}]{"}"}
+                  </p>
+                  {apiDomains.length > 0 && (
+                    <div className="mt-2 p-2 bg-white rounded border border-purple-200">
+                      <p className="text-sm text-green-700 font-medium">
+                        ✓ Завантажено {apiDomains.length} доменів
+                      </p>
+                      <details className="mt-1">
+                        <summary className="text-xs text-purple-600 cursor-pointer hover:text-purple-800">
+                          Переглянути перші 10 доменів...
+                        </summary>
+                        <div className="mt-1 text-xs text-gray-600 font-mono max-h-32 overflow-y-auto">
+                          {apiDomains.slice(0, 10).map((d, i) => (
+                            <div key={i}>{d}</div>
+                          ))}
+                          {apiDomains.length > 10 && <div>... та ще {apiDomains.length - 10}</div>}
+                        </div>
+                      </details>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Текстове поле для ручного вводу */}
-              {!newJob.useUploadedDomains && (
+              {newJob.domainSource === 'manual' && (
                 <textarea
                   value={newJob.domains}
                   onChange={(e) => setNewJob({...newJob, domains: e.target.value})}
@@ -368,9 +466,15 @@ export default function Scheduler() {
                 />
               )}
               
-              {newJob.useUploadedDomains && uploadedDomainsCount === 0 && (
+              {newJob.domainSource === 'uploaded' && uploadedDomainsCount === 0 && (
                 <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-md text-sm text-yellow-700">
                   ⚠️ Немає завантажених доменів. Перейдіть у <strong>Configuration</strong> та завантажте JSON файл з доменами.
+                </div>
+              )}
+              
+              {newJob.domainSource === 'api' && apiDomains.length === 0 && apiUrl && (
+                <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-md text-sm text-yellow-700">
+                  ⚠️ Введіть URL та натисніть "Завантажити" для отримання доменів.
                 </div>
               )}
             </div>

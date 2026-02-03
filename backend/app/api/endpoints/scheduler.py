@@ -2,8 +2,10 @@ from fastapi import APIRouter, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
+from urllib.parse import urlparse
 import redis
 import logging
+import httpx
 
 from app.services.scheduler import get_scheduler, init_default_jobs
 from app.core.config import settings
@@ -325,3 +327,122 @@ async def initialize_default_jobs(
         "jobs_count": len(jobs),
         "jobs": jobs
     }
+
+
+class FetchDomainsRequest(BaseModel):
+    """Запит на отримання доменів з зовнішнього API"""
+    api_url: str = Field(..., description="URL зовнішнього API")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "api_url": "https://www.promokod.com.ua/api/shops-info?key=xxx&page=1"
+            }
+        }
+
+
+@router.post("/fetch-domains-from-api")
+async def fetch_domains_from_api(request: FetchDomainsRequest):
+    """
+    Отримати домени з зовнішнього API.
+    
+    Очікуваний формат відповіді API:
+    {
+        "status": true,
+        "data": [
+            {"id": 1, "name": "Shop", "url": "https://example.com/", ...},
+            ...
+        ]
+    }
+    
+    Домен витягується з поля "url" кожного елемента.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(request.api_url)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Перевіряємо структуру відповіді
+            if not isinstance(data, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Невірний формат відповіді API: очікується об'єкт"
+                )
+            
+            # Отримуємо масив даних
+            items = data.get("data", [])
+            if not items:
+                # Спробуємо інші можливі ключі
+                items = data.get("items", []) or data.get("shops", []) or data.get("results", [])
+            
+            if not isinstance(items, list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Невірний формат відповіді API: 'data' повинен бути масивом"
+                )
+            
+            domains = []
+            for item in items:
+                if isinstance(item, dict):
+                    # Пробуємо отримати URL з різних полів
+                    url = item.get("url") or item.get("domain") or item.get("site") or item.get("website")
+                    if url:
+                        # Витягуємо домен з URL
+                        try:
+                            parsed = urlparse(url.strip())
+                            domain = parsed.netloc or parsed.path.split('/')[0]
+                            # Видаляємо www. якщо є
+                            if domain.startswith("www."):
+                                domain = domain[4:]
+                            if domain:
+                                domains.append(domain)
+                        except Exception:
+                            # Якщо не вдалося розпарсити, пробуємо як є
+                            domain = url.strip().replace("https://", "").replace("http://", "").rstrip("/")
+                            if domain.startswith("www."):
+                                domain = domain[4:]
+                            if domain:
+                                domains.append(domain.split("/")[0])
+                elif isinstance(item, str):
+                    # Якщо item - це просто рядок (домен)
+                    domain = item.strip()
+                    if domain.startswith("www."):
+                        domain = domain[4:]
+                    if domain:
+                        domains.append(domain)
+            
+            # Видаляємо дублікати зберігаючи порядок
+            seen = set()
+            unique_domains = []
+            for d in domains:
+                if d not in seen:
+                    seen.add(d)
+                    unique_domains.append(d)
+            
+            logger.info(f"Завантажено {len(unique_domains)} доменів з зовнішнього API")
+            
+            return {
+                "success": True,
+                "count": len(unique_domains),
+                "domains": unique_domains,
+                "source_url": request.api_url
+            }
+            
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Помилка HTTP: {e.response.status_code}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Помилка запиту: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Помилка отримання доменів з API: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Помилка: {str(e)}"
+        )

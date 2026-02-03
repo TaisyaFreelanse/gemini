@@ -85,6 +85,8 @@ export const schedulerAPI = {
   getJob: (jobId) => apiClient.get(`/scheduler/jobs/${jobId}`),
   initDefaults: (domains, config) => 
     apiClient.post('/scheduler/init-defaults', { domains, config }),
+  fetchDomainsFromApi: (apiUrl) => 
+    apiClient.post('/scheduler/fetch-domains-from-api', { api_url: apiUrl }),
 };
 
 // ========== Logs API ==========
