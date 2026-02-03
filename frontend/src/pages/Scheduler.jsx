@@ -8,7 +8,7 @@ export default function Scheduler() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newJob, setNewJob] = useState({
     job_id: '',
-    cron_expression: '* * * * *',  // кожну хвилину — для тесту
+    cron_expression: '',  // користувач повинен обрати
     job_type: 'full_scraping',
     domains: '',
     batch_size: 500,
@@ -63,6 +63,12 @@ export default function Scheduler() {
   const handleAddJob = async (e) => {
     e.preventDefault();
     
+    // Валідація cron виразу
+    if (!newJob.cron_expression || newJob.cron_expression.trim() === '') {
+      setMessage({ type: 'error', text: 'Оберіть розклад запуску' });
+      return;
+    }
+    
     try {
       let domains = [];
       
@@ -83,8 +89,11 @@ export default function Scheduler() {
         }
       }
       
+      // Використовуємо введений ID або генеруємо автоматично
+      const jobId = newJob.job_id.trim() || generateJobId();
+      
       await schedulerAPI.addJob({
-        job_id: newJob.job_id,
+        job_id: jobId,
         cron_expression: newJob.cron_expression,
         job_type: newJob.job_type,
         domains,
@@ -95,7 +104,7 @@ export default function Scheduler() {
       setShowAddForm(false);
       setNewJob({
         job_id: '',
-        cron_expression: '* * * * *',
+        cron_expression: '',
         job_type: 'full_scraping',
         domains: '',
         batch_size: 500,
@@ -143,14 +152,27 @@ export default function Scheduler() {
   }
 
   const cronExamples = [
-    { label: 'Кожну хвилину (тест)', value: '* * * * *' },
-    { label: 'Кожні 5 хвилин', value: '*/5 * * * *' },
-    { label: 'Кожні 30 хвилин', value: '*/30 * * * *' },
-    { label: 'Кожні 6 годин', value: '0 */6 * * *' },
-    { label: 'Кожні 2 години', value: '0 */2 * * *' },
-    { label: 'Щодня о 00:00', value: '0 0 * * *' },
-    { label: 'Понеділок о 9:00', value: '0 9 * * 1' },
+    { label: '-- Оберіть час --', value: '' },
+    { label: '📅 Щодня о 09:00 UTC (11:00 Київ)', value: '0 9 * * *' },
+    { label: '📅 Щодня о 11:00 UTC (13:00 Київ)', value: '0 11 * * *' },
+    { label: '📅 Щодня о 17:00 UTC (19:00 Київ)', value: '0 17 * * *' },
+    { label: '📅 Двічі на день: 09:00 та 17:00 UTC', value: '0 9,17 * * *' },
+    { label: '⏰ Кожні 6 годин', value: '0 */6 * * *' },
+    { label: '⏰ Кожні 2 години', value: '0 */2 * * *' },
+    { label: '⏰ Кожні 30 хвилин', value: '*/30 * * * *' },
+    { label: '📆 Понеділок о 09:00 UTC', value: '0 9 * * 1' },
+    { label: '📆 Вівторок о 09:00 UTC', value: '0 9 * * 2' },
+    { label: '📆 Середа о 09:00 UTC', value: '0 9 * * 3' },
+    { label: '📆 Четвер о 09:00 UTC', value: '0 9 * * 4' },
+    { label: '📆 П\'ятниця о 09:00 UTC', value: '0 9 * * 5' },
+    { label: '🔧 Кожну хвилину (тест)', value: '* * * * *' },
   ];
+  
+  // Генерація ID задачі якщо не вказано
+  const generateJobId = () => {
+    const now = new Date();
+    return `job_${now.getFullYear()}${(now.getMonth()+1).toString().padStart(2,'0')}${now.getDate().toString().padStart(2,'0')}_${now.getHours().toString().padStart(2,'0')}${now.getMinutes().toString().padStart(2,'0')}`;
+  };
 
   return (
     <div className="space-y-6">
@@ -205,15 +227,14 @@ export default function Scheduler() {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  ID задачі
+                  ID задачі <span className="text-gray-400 font-normal">(необов'язково)</span>
                 </label>
                 <input
                   type="text"
                   value={newJob.job_id}
                   onChange={(e) => setNewJob({...newJob, job_id: e.target.value})}
                   className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                  placeholder="my_job"
-                  required
+                  placeholder="full_scraping (автогенерація якщо пусто)"
                 />
               </div>
 
@@ -234,26 +255,52 @@ export default function Scheduler() {
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                Cron вираз
+                Розклад запуску
               </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={newJob.cron_expression}
-                  onChange={(e) => setNewJob({...newJob, cron_expression: e.target.value})}
-                  className="flex-1 px-3 py-2 border border-gray-300 rounded-md font-mono"
-                  placeholder="* * * * * (5 полів: хв год день міс тижд)"
-                  required
-                />
+              
+              {/* Простий вибір часу */}
+              <div className="mb-3">
                 <select
-                  onChange={(e) => setNewJob({...newJob, cron_expression: e.target.value})}
-                  className="px-3 py-2 border border-gray-300 rounded-md"
+                  onChange={(e) => e.target.value && setNewJob({...newJob, cron_expression: e.target.value})}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white"
+                  value={newJob.cron_expression}
                 >
-                  <option value="">Приклади...</option>
                   {cronExamples.map(ex => (
                     <option key={ex.value} value={ex.value}>{ex.label}</option>
                   ))}
                 </select>
+              </div>
+              
+              {/* Або ручний ввід */}
+              <details className="text-sm">
+                <summary className="cursor-pointer text-blue-600 hover:text-blue-800 mb-2">
+                  Або ввести cron вираз вручну
+                </summary>
+                <div className="mt-2 p-3 bg-gray-50 rounded-md">
+                  <input
+                    type="text"
+                    value={newJob.cron_expression}
+                    onChange={(e) => setNewJob({...newJob, cron_expression: e.target.value})}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-sm"
+                    placeholder="хвилина година день місяць день_тижня"
+                  />
+                  <div className="mt-2 text-xs text-gray-500">
+                    <p className="font-medium mb-1">Формат: хв год день міс день_тижня</p>
+                    <ul className="list-disc list-inside space-y-0.5">
+                      <li><code className="bg-gray-200 px-1">0 9 * * *</code> — щодня о 09:00</li>
+                      <li><code className="bg-gray-200 px-1">0 9 * * 1</code> — понеділок о 09:00</li>
+                      <li><code className="bg-gray-200 px-1">0 9,17 * * *</code> — о 09:00 та 17:00</li>
+                      <li><code className="bg-gray-200 px-1">*/30 * * * *</code> — кожні 30 хв</li>
+                    </ul>
+                  </div>
+                </div>
+              </details>
+              
+              {/* Інформація про часовий пояс */}
+              <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-700">
+                ⏰ <strong>Часовий пояс: UTC</strong> (Київ = UTC+2 зимою, UTC+3 влітку)
+                <br />
+                Наприклад: 09:00 UTC = 11:00 за київським часом (зима)
               </div>
             </div>
 
