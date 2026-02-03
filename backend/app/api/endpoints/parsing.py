@@ -451,6 +451,8 @@ def _idle_status() -> ParsingStatusResponse:
 async def get_parsing_status(db: Session = Depends(get_db)):
     """
     Отримати статус поточного процесу парсингу з реальними даними з БД
+    
+    Синхронізує scraping:status з parsing:active_session для коректного відображення
     """
     import logging
     from app.db import crud
@@ -471,6 +473,24 @@ async def get_parsing_status(db: Session = Depends(get_db)):
     except Exception as e:
         logger.warning("Redis session_id read failed: %s", e)
         session_id = None
+    
+    # Перевіряємо активну сесію з scheduler
+    try:
+        active_session_raw = redis_client.get("parsing:active_session")
+        active_session_id = int(active_session_raw.decode()) if active_session_raw else None
+    except Exception:
+        active_session_id = None
+    
+    # Синхронізуємо: якщо є активна сесія але status не "running", синхронізуємо
+    if active_session_id and status_str not in ("running", "stopping"):
+        session_id = active_session_id
+        status_str = "running"
+        # Оновлюємо Redis для консистентності
+        try:
+            redis_client.set("scraping:status", "running")
+            redis_client.set("scraping:session_id", str(active_session_id))
+        except Exception:
+            pass
 
     if session_id:
         try:
@@ -565,3 +585,163 @@ async def get_parsing_history(
         sessions=[],
         total=0
     )
+
+
+@router.get("/diagnostic")
+async def get_parsing_diagnostic(db: Session = Depends(get_db)):
+    """
+    Отримати діагностичну інформацію про стан парсингу.
+    Корисно для дебагу рассинхронізації статусів.
+    """
+    from app.db import crud
+    
+    result = {
+        "redis": {},
+        "db": {},
+        "celery": {},
+        "recommendations": []
+    }
+    
+    # Redis state
+    try:
+        result["redis"]["scraping:status"] = redis_client.get("scraping:status")
+        if result["redis"]["scraping:status"]:
+            result["redis"]["scraping:status"] = result["redis"]["scraping:status"].decode()
+        
+        result["redis"]["scraping:session_id"] = redis_client.get("scraping:session_id")
+        if result["redis"]["scraping:session_id"]:
+            result["redis"]["scraping:session_id"] = result["redis"]["scraping:session_id"].decode()
+        
+        result["redis"]["parsing:active_session"] = redis_client.get("parsing:active_session")
+        if result["redis"]["parsing:active_session"]:
+            result["redis"]["parsing:active_session"] = result["redis"]["parsing:active_session"].decode()
+        
+        result["redis"]["scraping:stop_requested"] = redis_client.get("scraping:stop_requested")
+        if result["redis"]["scraping:stop_requested"]:
+            result["redis"]["scraping:stop_requested"] = result["redis"]["scraping:stop_requested"].decode()
+        
+        # TTL для active_session
+        ttl = redis_client.ttl("parsing:active_session")
+        result["redis"]["parsing:active_session_ttl"] = ttl if ttl > 0 else None
+        
+    except Exception as e:
+        result["redis"]["error"] = str(e)
+    
+    # DB state for active session
+    try:
+        active_session_id = result["redis"].get("parsing:active_session")
+        if active_session_id:
+            session = crud.get_scraping_session(db, int(active_session_id))
+            if session:
+                result["db"]["session_id"] = session.id
+                result["db"]["status"] = session.status
+                result["db"]["total_domains"] = session.total_domains
+                result["db"]["processed_domains"] = session.processed_domains
+                result["db"]["successful_domains"] = session.successful_domains
+                result["db"]["failed_domains"] = session.failed_domains
+                result["db"]["started_at"] = session.started_at.isoformat() if session.started_at else None
+    except Exception as e:
+        result["db"]["error"] = str(e)
+    
+    # Celery state
+    try:
+        from app.tasks.celery_app import celery_app
+        inspect = celery_app.control.inspect()
+        active = inspect.active()
+        reserved = inspect.reserved()
+        
+        result["celery"]["active_tasks"] = sum(len(v) for v in (active or {}).values())
+        result["celery"]["reserved_tasks"] = sum(len(v) for v in (reserved or {}).values())
+        
+        # Отримуємо кількість задач в черзі
+        try:
+            with celery_app.connection_or_acquire() as conn:
+                queue_length = conn.default_channel.queue_declare(
+                    queue='celery', passive=True
+                ).message_count
+                result["celery"]["queue_length"] = queue_length
+        except Exception:
+            result["celery"]["queue_length"] = "unknown"
+            
+    except Exception as e:
+        result["celery"]["error"] = str(e)
+    
+    # Recommendations
+    if result["redis"].get("parsing:active_session") and result["redis"].get("scraping:status") != "running":
+        result["recommendations"].append(
+            "Десинхронізація: є активна сесія але статус не 'running'. "
+            "Використайте POST /api/v1/parsing/sync-state для синхронізації."
+        )
+    
+    if result["celery"].get("active_tasks", 0) == 0 and result["redis"].get("parsing:active_session"):
+        result["recommendations"].append(
+            "Можливо застрягла сесія: активна сесія є, але Celery не обробляє задачі. "
+            "Використайте POST /api/v1/parsing/clear-queue для очистки."
+        )
+    
+    return result
+
+
+@router.post("/sync-state")
+async def sync_parsing_state(db: Session = Depends(get_db)):
+    """
+    Синхронізувати стан парсингу між Redis ключами.
+    
+    Якщо є активна сесія (parsing:active_session) але scraping:status не відповідає,
+    синхронізує їх.
+    """
+    from app.db import crud
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    result = {"synced": False, "actions": []}
+    
+    try:
+        active_session_raw = redis_client.get("parsing:active_session")
+        active_session_id = int(active_session_raw.decode()) if active_session_raw else None
+        
+        current_status = redis_client.get("scraping:status")
+        status_str = current_status.decode() if current_status else "idle"
+        
+        if active_session_id:
+            # Є активна сесія - перевіряємо її статус в БД
+            session = crud.get_scraping_session(db, active_session_id)
+            
+            if session and session.status in ("running", "pending"):
+                # Сесія активна в БД - синхронізуємо Redis
+                if status_str != "running":
+                    redis_client.set("scraping:status", "running")
+                    redis_client.set("scraping:session_id", str(active_session_id))
+                    result["actions"].append(f"Встановлено scraping:status=running для сесії {active_session_id}")
+                result["synced"] = True
+            elif session and session.status in ("completed", "failed"):
+                # Сесія завершена в БД - очищаємо active_session
+                redis_client.delete("parsing:active_session")
+                redis_client.set("scraping:status", session.status)
+                result["actions"].append(f"Очищено active_session, статус={session.status}")
+                result["synced"] = True
+            else:
+                # Сесія не знайдена - очищаємо все
+                redis_client.delete("parsing:active_session")
+                redis_client.set("scraping:status", "idle")
+                redis_client.delete("scraping:session_id")
+                result["actions"].append("Очищено застряглий стан (сесія не знайдена в БД)")
+                result["synced"] = True
+        else:
+            # Немає активної сесії
+            if status_str == "running":
+                # Статус running але немає активної сесії - скидаємо
+                redis_client.set("scraping:status", "idle")
+                redis_client.delete("scraping:session_id")
+                result["actions"].append("Скинуто статус running без активної сесії")
+                result["synced"] = True
+            else:
+                result["actions"].append("Стан вже синхронізований")
+                result["synced"] = True
+        
+        logger.info(f"Sync state result: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error syncing state: {e}")
+        return {"synced": False, "error": str(e)}

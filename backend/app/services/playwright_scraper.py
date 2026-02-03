@@ -341,8 +341,22 @@ async def fetch_with_playwright(
     Returns:
         Tuple[html_content, error_message]
     """
-    scraper = await get_playwright_scraper(proxy_config=proxy_config, timeout=timeout)
-    return await scraper.fetch_with_browser(url)
+    # Загальний timeout на всю операцію (30 секунд максимум)
+    overall_timeout = 30.0
+    
+    try:
+        scraper = await get_playwright_scraper(proxy_config=proxy_config, timeout=timeout)
+        result = await asyncio.wait_for(
+            scraper.fetch_with_browser(url),
+            timeout=overall_timeout
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.warning(f"Playwright: загальний таймаут {overall_timeout}с для {url}")
+        return None, f"Playwright: загальний таймаут {overall_timeout}с"
+    except Exception as e:
+        logger.error(f"Playwright fetch error: {e}")
+        return None, f"Playwright error: {str(e)[:100]}"
 
 
 async def close_playwright_scraper():

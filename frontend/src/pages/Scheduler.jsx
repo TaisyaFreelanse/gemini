@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { schedulerAPI, configAPI } from '../api/client';
+import { schedulerAPI, configAPI, parsingAPI } from '../api/client';
 
 export default function Scheduler() {
   const [status, setStatus] = useState(null);
@@ -19,13 +19,53 @@ export default function Scheduler() {
   const [apiUrl, setApiUrl] = useState('');
   const [apiDomains, setApiDomains] = useState([]);
   const [apiLoading, setApiLoading] = useState(false);
+  const [diagnostic, setDiagnostic] = useState(null);
+  const [clearingQueue, setClearingQueue] = useState(false);
 
   useEffect(() => {
     fetchStatus();
     fetchUploadedDomains();
-    const interval = setInterval(fetchStatus, 10000);
+    fetchDiagnostic();
+    const interval = setInterval(() => {
+      fetchStatus();
+      fetchDiagnostic();
+    }, 10000);
     return () => clearInterval(interval);
   }, []);
+
+  const fetchDiagnostic = async () => {
+    try {
+      const response = await parsingAPI.diagnostic();
+      setDiagnostic(response.data);
+    } catch (err) {
+      console.error('Error fetching diagnostic:', err);
+    }
+  };
+
+  const handleClearStuckSession = async () => {
+    if (!confirm('Очистити застряглу сесію? Це скасує всі активні задачі парсингу.')) return;
+    
+    setClearingQueue(true);
+    try {
+      // Спочатку очищаємо чергу
+      const clearResult = await parsingAPI.clearQueue();
+      // Потім синхронізуємо стан
+      await parsingAPI.syncState();
+      
+      setMessage({ 
+        type: 'success', 
+        text: `Застряглу сесію очищено. ${clearResult.data?.details?.purged_count || 0} задач скасовано.`
+      });
+      
+      // Оновлюємо діагностику
+      fetchDiagnostic();
+      fetchStatus();
+    } catch (err) {
+      setMessage({ type: 'error', text: `Помилка очищення: ${err.response?.data?.detail || err.message}` });
+    } finally {
+      setClearingQueue(false);
+    }
+  };
 
   const fetchUploadedDomains = async () => {
     try {
@@ -239,6 +279,98 @@ export default function Scheduler() {
             : 'bg-red-50 border border-red-200 text-red-700'
         }`}>
           {message.text}
+        </div>
+      )}
+
+      {/* Блок діагностики застряглих сесій */}
+      {diagnostic && (
+        <div className={`rounded-lg shadow p-4 ${
+          diagnostic.redis?.['parsing:active_session'] 
+            ? 'bg-yellow-50 border-2 border-yellow-400' 
+            : 'bg-white'
+        }`}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
+                diagnostic.redis?.['parsing:active_session']
+                  ? 'bg-yellow-200 text-yellow-800'
+                  : 'bg-green-200 text-green-800'
+              }`}>
+                {diagnostic.redis?.['parsing:active_session'] ? '⚠️' : '✓'}
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">
+                  {diagnostic.redis?.['parsing:active_session'] 
+                    ? `Активна сесія #${diagnostic.redis['parsing:active_session']}` 
+                    : 'Немає активних сесій'}
+                </h3>
+                <p className="text-sm text-gray-600">
+                  Статус: <span className="font-medium">{diagnostic.redis?.['scraping:status'] || 'idle'}</span>
+                  {diagnostic.redis?.['parsing:active_session_ttl'] && (
+                    <span className="ml-2 text-gray-500">
+                      (TTL: {Math.round(diagnostic.redis['parsing:active_session_ttl'] / 60)} хв)
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            
+            {diagnostic.redis?.['parsing:active_session'] && (
+              <button
+                onClick={handleClearStuckSession}
+                disabled={clearingQueue}
+                className="px-4 py-2 bg-yellow-600 text-white font-medium rounded-md hover:bg-yellow-700 disabled:bg-yellow-300 flex items-center gap-2"
+              >
+                {clearingQueue ? (
+                  <>
+                    <span className="animate-spin">⏳</span>
+                    Очищення...
+                  </>
+                ) : (
+                  <>
+                    🧹 Очистити застряглу сесію
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+          
+          {/* Детальна інформація */}
+          {diagnostic.redis?.['parsing:active_session'] && (
+            <details className="mt-3">
+              <summary className="text-sm text-gray-600 cursor-pointer hover:text-gray-800">
+                Детальна діагностика...
+              </summary>
+              <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                <div className="p-2 bg-gray-100 rounded">
+                  <div className="text-gray-500">DB Status</div>
+                  <div className="font-medium">{diagnostic.db?.status || 'N/A'}</div>
+                </div>
+                <div className="p-2 bg-gray-100 rounded">
+                  <div className="text-gray-500">Processed</div>
+                  <div className="font-medium">{diagnostic.db?.processed_domains || 0} / {diagnostic.db?.total_domains || 0}</div>
+                </div>
+                <div className="p-2 bg-gray-100 rounded">
+                  <div className="text-gray-500">Celery Active</div>
+                  <div className="font-medium">{diagnostic.celery?.active_tasks ?? 'N/A'}</div>
+                </div>
+                <div className="p-2 bg-gray-100 rounded">
+                  <div className="text-gray-500">Queue Length</div>
+                  <div className="font-medium">{diagnostic.celery?.queue_length ?? 'N/A'}</div>
+                </div>
+              </div>
+              {diagnostic.recommendations?.length > 0 && (
+                <div className="mt-2 p-2 bg-yellow-100 rounded text-sm text-yellow-800">
+                  <strong>Рекомендації:</strong>
+                  <ul className="list-disc list-inside mt-1">
+                    {diagnostic.recommendations.map((rec, i) => (
+                      <li key={i}>{rec}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </details>
+          )}
         </div>
       )}
 

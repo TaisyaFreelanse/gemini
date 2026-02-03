@@ -45,6 +45,10 @@ export const parsingAPI = {
   stop: () => apiClient.post('/parsing/stop'),
   status: () => apiClient.get('/parsing/status'),
   progress: (sessionId) => apiClient.get(`/parsing/progress/${sessionId}`),
+  // Очистка застряглих сесій
+  clearQueue: () => apiClient.post('/parsing/clear-queue'),
+  syncState: () => apiClient.post('/parsing/sync-state'),
+  diagnostic: () => apiClient.get('/parsing/diagnostic'),
 };
 
 // ========== Configuration API ==========
