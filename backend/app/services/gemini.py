@@ -108,7 +108,7 @@ class GeminiService:
 
 СТРУКТУРА відповіді (ОБОВ'ЯЗКОВО JSON):
 [
-  {{
+  {
     "shop": "Назва магазину з сайту",
     "domain": "{domain}",
     "description": "Короткий опис акції (макс 60 символів)",
@@ -121,7 +121,7 @@ class GeminiService:
     "click_url": "Не знайдено",
     "discount": "20% або Не знайдено",
     "categories": ["3", "11"]
-  }}
+  }
 ]
 
 HTML контент сайту {domain}:
@@ -196,14 +196,13 @@ HTML контент сайту {domain}:
                 f"[Gemini] HTML обрізано для {domain!r}: orig={orig_len} max={max_len} (GEMINI_MAX_CONTENT_LENGTH)"
             )
         
-        # Екрануємо { і } в HTML, щоб .format() не інтерпретував їх як плейсхолдери
-        # (JS-код на сайтах часто містить {shop: ...}, {data: ...} тощо)
-        safe_html = html_content.replace("{", "{{").replace("}", "}}")
+        # Використовуємо .replace() замість .format() щоб уникнути KeyError
+        # якщо промпт містить {shop}, {code} тощо як приклади JSON
+        prompt = self.prompt_template
+        prompt = prompt.replace("{domain}", domain)
+        prompt = prompt.replace("{html_content}", html_content)
         
-        return self.prompt_template.format(
-            domain=domain,
-            html_content=safe_html
-        )
+        return prompt
 
     def _prepare_email_prompt(self, email_body: str, domain: str) -> str:
         """
@@ -412,7 +411,6 @@ HTML контент сайту {domain}:
             "invalid_deals_count": 0,
             "parse_error": None
         }
-        _friendly_shop_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
 
         # Перевіряємо кеш
         cache_key = None
@@ -423,13 +421,7 @@ HTML контент сайту {domain}:
             if cached:
                 return cached[0], None, cached[1]
 
-        try:
-            prompt = self._prepare_prompt(html_content, domain)
-        except Exception as e:
-            if "shop" in str(e).lower() or '"shop"' in str(e):
-                return [], _friendly_shop_msg, metadata
-            raise
-        
+        prompt = self._prepare_prompt(html_content, domain)
         deals, error, metadata = await self._extract_deals_core(prompt, domain)
         
         # Кешуємо успішний результат
@@ -448,7 +440,6 @@ HTML контент сайту {domain}:
             "invalid_deals_count": 0,
             "parse_error": None,
         }
-        _friendly_shop_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
 
         for attempt in range(1, self.max_retries + 1):
             metadata["attempts"] = attempt
@@ -464,6 +455,16 @@ HTML контент сайту {domain}:
 
                 if not (response_text or "").strip():
                     self._log_response_diagnostics(response, domain, response_text or "", "empty_or_blocked")
+                    # Якщо відповідь порожня - повертаємо помилку
+                    error_msg = "Gemini: відповідь порожня або заблокована"
+                    logger.warning(f"{error_msg} для {domain}")
+                    metadata["parse_error"] = error_msg
+                    if attempt >= self.max_retries:
+                        return [], error_msg, metadata
+                    wait_time = min(BACKOFF_BASE ** attempt, BACKOFF_MAX) + random.uniform(0, 1)
+                    await asyncio.sleep(wait_time)
+                    continue
+                    
                 logger.info(f"✓ Отримано відповідь від Gemini ({len(response_text)} символів)")
                 if response_text:
                     logger.debug(f"Перші 500 символів відповіді: {response_text[:500]}")
@@ -481,7 +482,7 @@ HTML контент сайту {domain}:
 
             except (ValueError, KeyError, AttributeError) as e:
                 err = str(e).strip()
-                error_msg = _friendly_shop_msg if ('"shop"' in err or err in ('\n    "shop"', '"shop"', "'shop'")) else f"Gemini SDK: {type(e).__name__}: {err[:200]}"
+                error_msg = f"Gemini SDK: {type(e).__name__}: {err[:200]}"
                 logger.error(error_msg)
                 metadata["parse_error"] = error_msg
                 if attempt >= self.max_retries:
@@ -518,7 +519,7 @@ HTML контент сайту {domain}:
                     logger.info(f"Продовжуємо після очікування {wait_time:.1f}с...")
                     continue
                 
-                error_msg = "Gemini: відповідь порожня або заблокована (немає тексту в parts)" if ('"shop"' in s or (s and "shop" in s and len(s) < 30)) else f"Gemini API: {type(e).__name__}: {s[:180]}"
+                error_msg = f"Gemini API: {type(e).__name__}: {s[:180]}"
                 logger.error(error_msg, exc_info=True)
                 metadata["parse_error"] = error_msg
                 if attempt >= self.max_retries:
@@ -562,11 +563,4 @@ HTML контент сайту {domain}:
         if not clean_html:
             return [], "Немає HTML контенту для аналізу", {}
 
-        _friendly = "Gemini: відповідь порожня або заблокована (немає тексту в parts)"
-        try:
-            return await self.extract_deals(clean_html, domain)
-        except Exception as e:
-            s = str(e).strip()
-            if '"shop"' in s or s in ('\n    "shop"', '"shop"', "'shop'") or ("shop" in s and len(s) < 50):
-                return [], _friendly, {"parse_error": _friendly}
-            raise
+        return await self.extract_deals(clean_html, domain)
