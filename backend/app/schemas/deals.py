@@ -7,8 +7,8 @@ class DealSchema(BaseModel):
     """Схема для промокоду/акції"""
     shop: str = Field(..., max_length=200, description="Назва магазину")
     domain: str = Field(..., max_length=255, description="Домен")
-    description: str = Field(..., max_length=60, description="Короткий опис акції")
-    full_description: str = Field(..., max_length=160, description="Повний опис умов")
+    description: str = Field(..., description="Короткий опис акції (буде обрізано до 60 символів)")
+    full_description: str = Field(..., description="Повний опис умов (буде обрізано до 160 символів)")
     code: str = Field(..., description="Промокод або 'Не знайдено'")
     date_start: Optional[str] = Field(None, description="Дата початку (YYYY-MM-DD HH:MM)")
     date_end: Optional[str] = Field(None, description="Дата закінчення (YYYY-MM-DD HH:MM)")
@@ -18,15 +18,21 @@ class DealSchema(BaseModel):
     discount: str = Field(default="Не знайдено", description="Розмір знижки або 'Не знайдено'")
     categories: List[str] = Field(default_factory=list, description="Список ID категорій")
 
-    @validator('description')
+    @validator('shop', pre=True, always=True)
+    def validate_shop_length(cls, v):
+        if v and len(v) > 200:
+            return v[:197] + "..."
+        return v
+    
+    @validator('description', pre=True, always=True)
     def validate_description_length(cls, v):
-        if len(v) > 60:
+        if v and len(v) > 60:
             return v[:57] + "..."
         return v
     
-    @validator('full_description')
+    @validator('full_description', pre=True, always=True)
     def validate_full_description_length(cls, v):
-        if len(v) > 160:
+        if v and len(v) > 160:
             return v[:157] + "..."
         return v
     
