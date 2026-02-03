@@ -2,8 +2,48 @@ from fastapi import APIRouter, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
+import redis
+import logging
 
 from app.services.scheduler import get_scheduler, init_default_jobs
+from app.core.config import settings
+from app.tasks.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
+
+def _clear_parsing_state():
+    """Очистити стан парсингу: чергу Celery та Redis ключі"""
+    try:
+        # Очищаємо чергу Celery
+        purged = celery_app.control.purge()
+        logger.info(f"Очищено {purged} задач з черги Celery")
+        
+        # Очищаємо Redis ключі
+        r = redis.from_url(settings.REDIS_URL)
+        r.delete("parsing:active_session")
+        r.delete("scraping:task_ids")
+        r.delete("scraping:session_id")
+        r.set("scraping:status", "idle")
+        r.delete("scraping:stop_requested")
+        
+        # Видаляємо ключі прогресу сесій
+        progress_keys = r.keys("session:*:progress")
+        if progress_keys:
+            r.delete(*progress_keys)
+        
+        counter_keys = r.keys("session:*:counters")
+        if counter_keys:
+            r.delete(*counter_keys)
+            
+        domain_keys = r.keys("session:*:domain_status")
+        if domain_keys:
+            r.delete(*domain_keys)
+        
+        logger.info("Стан парсингу очищено")
+        return True
+    except Exception as e:
+        logger.error(f"Помилка очищення стану парсингу: {e}")
+        return False
 
 router = APIRouter()
 
@@ -124,6 +164,10 @@ async def add_cron_job(job_data: CronJobCreate):
     """
     scheduler = get_scheduler()
     
+    # Очищаємо попередній стан парсингу перед створенням нової задачі
+    _clear_parsing_state()
+    logger.info(f"Очищено попередній стан перед створенням задачі '{job_data.job_id}'")
+    
     # Запускаємо scheduler якщо не запущений
     if not scheduler.is_running():
         scheduler.start()
@@ -164,7 +208,7 @@ async def add_cron_job(job_data: CronJobCreate):
 @router.delete("/jobs/{job_id}")
 async def remove_job(job_id: str):
     """
-    Видалити задачу
+    Видалити задачу та очистити чергу парсингу
     """
     scheduler = get_scheduler()
     
@@ -176,15 +220,19 @@ async def remove_job(job_id: str):
             detail=f"Задачу '{job_id}' не знайдено"
         )
     
+    # Очищаємо стан парсингу
+    cleared = _clear_parsing_state()
+    
     return {
-        "message": f"Задачу '{job_id}' успішно видалено"
+        "message": f"Задачу '{job_id}' успішно видалено",
+        "queue_cleared": cleared
     }
 
 
 @router.post("/jobs/{job_id}/pause")
 async def pause_job(job_id: str):
     """
-    Призупинити задачу
+    Призупинити задачу та очистити чергу парсингу
     """
     scheduler = get_scheduler()
     
@@ -196,8 +244,12 @@ async def pause_job(job_id: str):
             detail=f"Задачу '{job_id}' не знайдено"
         )
     
+    # Очищаємо стан парсингу
+    cleared = _clear_parsing_state()
+    
     return {
-        "message": f"Задачу '{job_id}' призупинено"
+        "message": f"Задачу '{job_id}' призупинено",
+        "queue_cleared": cleared
     }
 
 
