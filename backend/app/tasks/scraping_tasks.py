@@ -210,6 +210,18 @@ async def _scrape_domain_async(domain: str, session_id: int, config: Dict) -> Di
             _add_ui_log("WARNING", f"Gemini помилка для {domain}: {error[:100]}", domain)
             return result
         
+        # Підставляємо назву магазину з API (якщо є), а не з Gemini
+        shop_name = config.get('domain_names', {}).get(domain)
+        if shop_name:
+            for deal in deals:
+                deal.shop = shop_name
+                deal.domain = domain  # Гарантуємо правильний domain
+            logger.info(f"[shop override] {domain} → shop='{shop_name}' (з API)")
+        else:
+            # Навіть без shop_name — гарантуємо що domain правильний
+            for deal in deals:
+                deal.domain = domain
+        
         result['success'] = True
         result['deals_count'] = len(deals)
         result['deals'] = [deal.dict() for deal in deals]

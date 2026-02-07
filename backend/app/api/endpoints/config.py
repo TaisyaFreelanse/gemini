@@ -117,7 +117,7 @@ CONFIG_KEYS = (
     "config:webhook_url", "config:webhook_token",
     "config:proxy", "config:proxy_host", "config:proxy_http_port",
     "config:proxy_socks_port", "config:proxy_login", "config:proxy_password",
-    "config:domains", "config:domains_count",
+    "config:domains", "config:domains_count", "config:domain_names",
 )
 
 
@@ -332,6 +332,7 @@ async def upload_domains(data: dict, db: Session = Depends(get_db)):
         
         # Фільтруємо та валідуємо домени
         valid_domains = []
+        domain_names = {}  # Маппінг domain → name з API
         for d in domains:
             if isinstance(d, str) and d.strip():
                 domain = d.strip().lower()
@@ -344,6 +345,26 @@ async def upload_domains(data: dict, db: Session = Depends(get_db)):
                 domain = domain.rstrip("/")
                 if domain and "." in domain:
                     valid_domains.append(domain)
+            elif isinstance(d, dict):
+                # API формат: {"id": ..., "name": "ANSWEAR", "url": "https://answear.ua/", ...}
+                url = (d.get('url', '') or d.get('domain', '') or '').strip()
+                name = d.get('name', '')
+                if url:
+                    from urllib.parse import urlparse
+                    if '://' in url:
+                        parsed = urlparse(url)
+                        domain = (parsed.netloc or parsed.path).strip().lower().rstrip("/")
+                    else:
+                        domain = url.lower()
+                        if domain.startswith("https://"):
+                            domain = domain[8:]
+                        elif domain.startswith("http://"):
+                            domain = domain[7:]
+                        domain = domain.rstrip("/")
+                    if domain and "." in domain:
+                        valid_domains.append(domain)
+                        if name and name.strip():
+                            domain_names[domain] = name.strip()
         
         # Видаляємо дублікати
         valid_domains = list(dict.fromkeys(valid_domains))
@@ -354,6 +375,11 @@ async def upload_domains(data: dict, db: Session = Depends(get_db)):
         # Зберігаємо в Redis
         redis_client.set("config:domains", json.dumps(valid_domains))
         redis_client.set("config:domains_count", str(len(valid_domains)))
+        
+        # Зберігаємо маппінг domain → name (для підстановки в shop)
+        if domain_names:
+            redis_client.set("config:domain_names", json.dumps(domain_names))
+            logger.info(f"Збережено {len(domain_names)} назв магазинів з API")
         
         logger.info(f"Завантажено {len(valid_domains)} доменів")
         
@@ -407,6 +433,7 @@ async def clear_domains(db: Session = Depends(get_db)):
     """
     redis_client.delete("config:domains")
     redis_client.delete("config:domains_count")
+    redis_client.delete("config:domain_names")
     return {
         "success": True,
         "message": "Список доменів очищено"

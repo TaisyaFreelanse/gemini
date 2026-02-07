@@ -47,8 +47,32 @@ async def start_parsing(
     
     # Отримати список доменів
     domains = []
+    domain_names = {}  # Маппінг domain → shop name з API
     try:
         import json as json_module
+        
+        def _extract_domain_and_name(item):
+            """Витягнути домен та назву магазину з елемента API."""
+            domain = None
+            name = None
+            if isinstance(item, str):
+                domain = item.strip().lower()
+                if domain.startswith("https://"):
+                    domain = domain[8:]
+                elif domain.startswith("http://"):
+                    domain = domain[7:]
+                domain = domain.rstrip("/")
+            elif isinstance(item, dict):
+                url = (item.get('url', '') or item.get('domain', '') or '').strip()
+                name = item.get('name', '') or None
+                if url:
+                    if '://' in url:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(url)
+                        domain = (parsed.netloc or parsed.path).strip().lower().rstrip("/")
+                    else:
+                        domain = url.lower().rstrip("/")
+            return domain, (name.strip() if name else None)
         
         # 1. Спочатку перевіряємо завантажені домени з Redis (через Configuration)
         uploaded_domains_raw = redis_client.get("config:domains")
@@ -61,7 +85,15 @@ async def start_parsing(
             except Exception as e:
                 logger.warning(f"Помилка читання завантажених доменів: {e}")
         
-        # 2. Якщо немає завантажених доменів, пробуємо API
+        # Завантажуємо збережений маппінг domain → name з Redis
+        domain_names_raw = redis_client.get("config:domain_names")
+        if domain_names_raw:
+            try:
+                domain_names = json_module.loads(domain_names_raw.decode())
+                logger.info(f"Завантажено {len(domain_names)} назв магазинів з Redis")
+            except Exception as e:
+                logger.warning(f"Помилка читання domain_names: {e}")
+        
         # 2. Якщо немає завантажених доменів, пробуємо API або файл
         if not domains:
             # Отримуємо URL API з конфігурації
@@ -89,21 +121,13 @@ async def start_parsing(
                     else:
                         raw_domains = []
                     
-                    # Обробляємо домени
+                    # Обробляємо домени та витягуємо назви
                     for item in raw_domains:
-                        if isinstance(item, str):
-                            domains.append(item)
-                        elif isinstance(item, dict):
-                            url = item.get('url', '') or item.get('domain', '') or item.get('name', '')
-                            if url:
-                                if '://' in url:
-                                    from urllib.parse import urlparse
-                                    parsed = urlparse(url)
-                                    domain = parsed.netloc or parsed.path
-                                else:
-                                    domain = url
-                                if domain:
-                                    domains.append(domain)
+                        domain, name = _extract_domain_and_name(item)
+                        if domain:
+                            domains.append(domain)
+                            if name:
+                                domain_names[domain] = name
                 else:
                     logger.warning(f"Файл api.json не знайдено: {api_json_path}")
             else:
@@ -120,20 +144,13 @@ async def start_parsing(
                             else:
                                 raw_domains = []
                             
-                            # Обробляємо домени (можуть бути строки або об'єкти)
+                            # Обробляємо домени та витягуємо назви
                             for item in raw_domains:
-                                if isinstance(item, str):
-                                    domains.append(item)
-                                elif isinstance(item, dict):
-                                    url = item.get('url', '') or item.get('domain', '')
-                                    if url and '://' in url:
-                                        from urllib.parse import urlparse
-                                        parsed = urlparse(url)
-                                        domain = parsed.netloc or parsed.path
-                                    else:
-                                        domain = url
-                                    if domain:
-                                        domains.append(domain)
+                                domain, name = _extract_domain_and_name(item)
+                                if domain:
+                                    domains.append(domain)
+                                    if name:
+                                        domain_names[domain] = name
                         else:
                             raise HTTPException(
                                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -247,7 +264,8 @@ async def start_parsing(
                 'socks_port': proxy_socks_port,
                 'login': proxy_login,
                 'password': proxy_password
-            } if proxy_host else None
+            } if proxy_host else None,
+            'domain_names': domain_names  # Маппінг domain → shop name з API
         }
         
         start_batch_scraping.delay(domains, session.id, config)
